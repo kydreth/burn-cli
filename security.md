@@ -1,118 +1,120 @@
 # Security Analysis
 
-**Subject:** codeburn — Claude Code agent usage monitor  
-**Scope:** `codeburn` (Python script), `update-pricing` (Python script), `pricing.json`  
-**Data sources:** `~/.claude/projects/**/*.jsonl` (local, read-only), LiteLLM GitHub (fetch only during `update-pricing`)
+**Subject:** burn — Claude Code usage and cost dashboard (`burn-cli`)  
+**Scope:** `burn_cli/` (Python package), `update-pricing` (Python script), `burn_cli/pricing.json`  
+**Data sources:** `~/.claude/projects/**/*.jsonl` (local, read-only); one pinned GitHub raw URL, fetched only when `update-pricing` is run
 
 ---
 
 ## Trust model
 
-codeburn reads files written by Claude Code on the local machine and renders them to a terminal. It makes no network connections at runtime. `update-pricing` makes one outbound HTTPS fetch to LiteLLM's GitHub on demand.
+burn reads files written by Claude Code on the local machine and renders
+them to a terminal. It makes no network connections at runtime. `update-pricing`
+makes one outbound HTTPS fetch on demand.
 
-The primary attack surface is untrusted content in the JSONL session files — specifically, string fields written by Claude Code that could contain attacker-controlled values via prompt injection.
+The primary attack surface is untrusted content in the JSONL session files:
+string fields written by Claude Code that could contain attacker-controlled
+values via prompt injection (branch names, working directories, the user's
+first prompt).
 
-A secondary surface is the `update-pricing` fetch: a compromised LiteLLM repository or CDN incident could deliver poisoned pricing data.
+A secondary surface is the `update-pricing` fetch: a compromised upstream
+repository or CDN incident could deliver poisoned pricing data.
+
+A third concern is not an attack but a leak: the dashboard can display the
+first prompt of each session, and screenshots of it travel.
+
+---
+
+## Comparison with other local usage dashboards
+
+Several open-source tools solve the same problem for multiple agent vendors
+(Node/TypeScript TUIs with SQLite reads, currency conversion and export). The
+vulnerability classes reported against that category, and their status here:
+
+| Class | Applies? | Status here |
+|---|---|---|
+| Shell command extraction feeding an execution path | No | No subprocess execution or command parsing anywhere |
+| Native database driver vulnerabilities | No | No database; plain JSON lines |
+| Unvalidated currency-conversion API | No | No currency conversion |
+| Formula injection in CSV export | No | No CSV export; `--json` emits JSON only |
+| ReDoS via user-supplied project filter | No | `--project` is a plain substring match; config regexes are the user's own |
+| Config-directory environment-variable override | No | `~/.claude/projects/` is hard-coded |
+| Terminal injection via dashboard output | Yes | **Fixed** — `_sanitize()` on every JSONL-sourced string |
+| Unvalidated upstream pricing fetch | Yes | **Fixed** — pinned commit, mandatory diff review |
+| World-readable cache file | Informational | `pricing.json` contains public rates only |
 
 ---
 
 ## Findings
 
-### 1. Terminal escape injection via JSONL field values — **Fixed**
+### 1. Terminal escape injection via JSONL field values — Fixed
 
-`gitBranch` and `cwd` are read from JSONL and were previously rendered to the terminal without sanitisation. An attacker who could write to the session log (e.g. via prompt injection against Claude Code) could embed ANSI escape sequences to manipulate terminal output.
+`gitBranch`, `cwd` and the first user prompt are rendered to the terminal.
+An attacker who can influence the session log (e.g. via prompt injection
+against Claude Code) could embed ANSI sequences.
 
-**Fix:** `_sanitize()` strips CSI sequences (`\x1b[...m`), bare ESC sequences, and all control characters. Applied to `git_branch` and `cwd` at parse time in `_parse_jsonl()`, before any display use.
+**Fix:** `_sanitize()` strips CSI sequences, bare ESC sequences and all
+control characters at parse time, before any display use.
 
----
+### 2. `update-pricing` merge dropped manually added entries — Fixed
 
-### 2. `update-pricing` merge silently dropped manually added model entries — **Fixed**
+Merge now starts from the existing file and overlays fresh data, so entries
+added by hand survive a refresh.
 
-The previous merge logic used `if not isinstance(v, dict) or "_" in k` to decide what to keep from the existing file. Model keys use hyphens (`claude-sonnet-4-6`), not underscores, so the `"_" in k` condition was always False for them. Any model entry added by hand was silently deleted on the next `./update-pricing` run, despite the comment claiming otherwise.
+### 3. `update-pricing` wrote without showing a diff — Fixed
 
-**Fix:** Merge now starts with `dict(existing)` and calls `.update(fresh)` — fresh data wins on key conflicts, everything else (including manually added models) survives.
+The script prints added / removed / changed entries with old and new values.
+On a TTY it asks for confirmation; off a TTY it refuses unless `--yes` is
+passed. Nothing is written when there are no changes.
 
----
+### 4. Silent fallback pricing — Fixed
 
-### 3. `update-pricing` fetched pricing with no diff shown — **Fixed**
+Earlier versions priced any unrecognised model at Sonnet rates with no
+warning, and a longest-prefix match let a short key like `"claude"` in
+`pricing.json` override every unknown model. Both are gone: lookup is exact
+match → date-suffix strip → *unpriced*. Unpriced tokens are counted, warned
+about once per model on stderr, and marked `+?` on every figure that
+includes them. The fallback rate constant no longer exists.
 
-`./update-pricing` previously printed "wrote 20 models" with no indication of what changed. A poisoned LiteLLM update could silently alter rates.
+### 5. `import re` in a hot function — Fixed
 
-**Fix:** Before writing, the script prints a diff of added (`+`), removed (`-`), and changed (`~`) entries with old and new values. Review the output before accepting the result.
+Hoisted to module level.
 
----
+### 6. Upstream pricing fetch without integrity check — Fixed
 
-### 4. `_lookup_pricing` prefix match created a catch-all poisoning foothold — **Fixed**
+`update-pricing` now fetches from a pinned commit SHA
+(`LITELLM_COMMIT`), not a moving branch. Bumping the pin is a deliberate
+edit, and the diff review in finding 3 is the human check on the new
+content. TLS is verified by `urllib` as before.
 
-The previous implementation included a longest-prefix fallback:
+### 7. `pricing.json` is world-readable — Informational
 
-```python
-candidates = [k for k in PRICING if model.startswith(k)]
-if candidates:
-    return PRICING[max(candidates, key=len)]
-```
+Default permissions (0644). Contents are public rates only.
 
-A single short key like `"claude"` in `pricing.json` with wrong rates would silently override costs for every unrecognised Claude model.
+### 8. Full conversation content parsed into memory — Low / design guard
 
-**Fix:** Prefix match removed. Lookup is now: exact match → strip 8-digit date suffix → `_FALLBACK_PRICING`. Unknown models get Sonnet rates and a warning to run `./update-pricing`.
+Each JSONL line is deserialised with `json.loads()` even though only a few
+keys are used. Message content passes through memory and is discarded. The
+parser retains only metadata and the first prompt (see finding 10). Lines of
+types other than `user` and `assistant` are skipped before parsing.
 
----
+### 9. Race on active session files — Informational
 
-### 5. `import re` inside hot function — **Fixed**
+`stat()` precedes `open()`; a write between them can make the "active"
+marker stale by one refresh. Cosmetic.
 
-`import re` was called inside `_lookup_pricing()`, which runs for every assistant turn in every parsed session.
+### 10. First prompt shown in TOP RUNS — Mitigated
 
-**Fix:** `import re` moved to the top-level imports block.
+The first user prompt of each session is useful context but is private text
+that ends up in screenshots. It is **hidden by default** and shown only with
+`--tasks`. `--redact` replaces prompt text and branch names with short
+hashes for anything you intend to share.
 
----
+### 11. No executable hooks in the repository — Policy
 
-### 6. `update-pricing` fetches from LiteLLM without content integrity check — Open
-
-`./update-pricing` fetches `model_prices_and_context_window.json` from LiteLLM's GitHub over HTTPS. Python's `urllib` verifies TLS certificates by default. However, there is no hash or signature check on the content itself. A compromised LiteLLM repository or a malicious PR could deliver wrong pricing data.
-
-The diff output added in finding #3 provides a human review step. For higher assurance, pin to a specific commit SHA:
-
-```
-LITELLM_URL = (
-    "https://raw.githubusercontent.com/BerriAI/litellm/<sha>"
-    "/model_prices_and_context_window.json"
-)
-```
-
----
-
-### 7. `pricing.json` is world-readable with default file permissions — Informational
-
-`PRICING_FILE.write_text(...)` uses default permissions (0644). On a multi-user system, other users can read `pricing.json`. The file contains no secrets — only model names and public pricing.
-
----
-
-### 8. Full conversation content parsed into memory — Low / Guard for future development
-
-Every JSONL line is fully deserialised with `json.loads()` even though only a few keys are read. The full object — including user prompts, assistant responses, and file contents — passes through memory before being discarded. Not a current issue; guard against this when extending `_parse_jsonl()`.
-
----
-
-### 9. Race condition on active session files — Informational
-
-`path.stat().st_mtime` is read before the file is opened. A write landing between `stat()` and `open()` means the mtime used for "active session" detection may be stale by one refresh cycle. Consequence is cosmetic only.
-
----
-
-## Installation note
-
-`~/.local/bin/codeburn` must be a symlink to the repository file, not a copy:
-
-```bash
-ln -sf ~/git/codeburn/codeburn ~/.local/bin/codeburn
-```
-
-A copy silently diverges from the repo on every update. Verify:
-
-```bash
-ls -la ~/.local/bin/codeburn
-# → ... ~/.local/bin/codeburn -> /path/to/checkout/codeburn
-```
+The repository ships no agent configuration, hooks, or issue-tracker
+metadata. Agent configuration is kept outside version control, so a clone
+never runs commands on session start.
 
 ---
 
@@ -121,11 +123,13 @@ ls -la ~/.local/bin/codeburn
 | # | Finding | Severity | Status |
 |---|---|---|---|
 | 1 | Terminal escape injection via JSONL values | Medium | Fixed |
-| 2 | Merge logic dropped manually added model entries | Low | Fixed |
-| 3 | No diff shown before overwriting pricing.json | Low | Fixed |
-| 4 | Prefix match catch-all poisoning foothold | Low | Fixed |
-| 5 | `import re` inside hot function | Informational | Fixed |
-| 6 | LiteLLM fetch without content integrity check | Low | Open — pin to commit SHA for higher assurance |
-| 7 | pricing.json world-readable (default permissions) | Informational | Acceptable — no secrets |
-| 8 | Full message content parsed into memory | Low | Acceptable — guard in future changes |
-| 9 | Race condition on active session files | Informational | Acceptable — cosmetic only |
+| 2 | Merge dropped manually added model entries | Low | Fixed |
+| 3 | No diff / confirmation before writing pricing.json | Low | Fixed |
+| 4 | Silent fallback pricing and prefix-match foothold | Low | Fixed |
+| 5 | `import re` in hot function | Informational | Fixed |
+| 6 | Upstream fetch without integrity check | Low | Fixed — pinned commit |
+| 7 | pricing.json world-readable | Informational | Acceptable |
+| 8 | Message content parsed into memory | Low | Acceptable — guarded |
+| 9 | Race on active session files | Informational | Acceptable |
+| 10 | First prompt visible in dashboard | Low (privacy) | Mitigated — off by default, `--redact` |
+| 11 | Executable hooks in repo | — | Policy — none shipped |

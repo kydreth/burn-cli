@@ -6,6 +6,7 @@ renders cost per project, session, model and day. No network, no API keys.
 
 __version__ = "0.1.0"
 
+import hashlib
 import json
 import os
 import re
@@ -73,6 +74,23 @@ _CTRL_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]|\x1b[^[]|[\x00-\x1f\x7f]")
 def _sanitize(s):
     """Strip ANSI escape sequences and control characters from untrusted strings."""
     return _CTRL_RE.sub("", s) if s else s
+
+# ── Redaction ─────────────────────────────────────────────────────────────────
+REDACT = False  # set by --redact: replace prompt text and branch names with hashes
+
+def redact(text):
+    """Stable 8-hex-digit stand-in for a private string (same input → same hash)."""
+    if not text:
+        return text
+    return "#" + hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:8]
+
+def display_branch(s):
+    b = s.get("git_branch")
+    return redact(b) if (REDACT and b) else b
+
+def display_task(s):
+    t = s.get("first_task")
+    return redact(t) if (REDACT and t) else t
 
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
@@ -279,6 +297,17 @@ def _parse_jsonl(path, proj_slug, since):
                 raw = raw.strip()
                 if not raw:
                     continue
+                # Cheap pre-filter: only user/assistant records carry anything we
+                # use. Attachments, hook summaries, snapshots etc. are skipped
+                # before the (expensive) JSON parse. Once the first prompt is
+                # known, user records (often huge tool results) are skipped too;
+                # assistant records carry the same timestamp/cwd/branch fields.
+                is_assistant = '"assistant"' in raw
+                is_user = (not is_assistant) and '"user"' in raw
+                if not (is_assistant or is_user):
+                    continue
+                if is_user and first_task is not None:
+                    continue
                 try:
                     obj = json.loads(raw)
                 except json.JSONDecodeError:
@@ -439,13 +468,17 @@ def model_badge(m):
         return c(GREEN, "haiku")
     return c(GRAY, m[:10])
 
-def _render_top_run(s):
+def _render_top_run(s, show_tasks):
     day = s["last_ts"].strftime("%m-%d")
     proj = c(WHITE, s["project"][:24].ljust(25))
-    task = s.get("first_task") or ""
-    task_str = c(GRAY, (task[:46] + "…" if len(task) > 47 else task.ljust(47)))
-    turns = c(GRAY, f"{s['messages']}t")
-    print(f"  {c(GRAY, day)}  {proj}  {task_str}  {session_cost(s)}  {turns}  {model_badge(s['model'])}")
+    if show_tasks:
+        detail = display_task(s) or ""
+    else:
+        b = display_branch(s)
+        detail = f"[{b}]" if b else ""
+    detail_str = c(GRAY, (detail[:46] + "…" if len(detail) > 47 else detail.ljust(47)))
+    turns = c(GRAY, f"{s['messages']}t".rjust(5))
+    print(f"  {c(GRAY, day)}  {proj}  {detail_str}  {session_cost(s)}  {turns}  {model_badge(s['model'])}")
 
 
 # ── Render functions ──────────────────────────────────────────────────────────
@@ -474,7 +507,8 @@ def render(sessions, args):
     if active:
         header("ACTIVE  (last 10 min)")
         for s in active[:MAX_ACTIVE]:
-            branch = f" [{s['git_branch']}]" if s.get("git_branch") else ""
+            b = display_branch(s)
+            branch = f" [{b}]" if b else ""
             age = fmt_age(s["mtime"])
             proj_str = c(WHITE, s["project"][:35].ljust(36))
             branch_str = c(GRAY, branch[:20].ljust(21))
@@ -536,7 +570,7 @@ def render(sessions, args):
         top_week = sorted(week_sessions, key=lambda s: -s["cost"])[:TOP_RUNS]
         header("TOP RUNS — LAST 7 DAYS")
         for s in top_week:
-            _render_top_run(s)
+            _render_top_run(s, args.tasks)
 
     # ── Top runs — all scanned ─────────────────────────────────────────────────
     if sessions:
@@ -544,7 +578,7 @@ def render(sessions, args):
         window_label = "ALL TIME" if args.all_time else "ALL SCANNED (30d)"
         header(f"TOP RUNS — {window_label}")
         for s in top_all:
-            _render_top_run(s)
+            _render_top_run(s, args.tasks)
 
     # ── Daily breakdown (last N days) ─────────────────────────────────────────
     days = args.days
@@ -577,7 +611,8 @@ def render(sessions, args):
         header(label)
         for s in top:
             day = s["last_ts"].strftime("%m-%d")
-            branch = f"[{s['git_branch']}]" if s.get("git_branch") else ""
+            b = display_branch(s)
+            branch = f"[{b}]" if b else ""
             print(f"  {c(GRAY, day)}  {c(WHITE, s['project'][:28].ljust(29))}"
                   f"  {c(GRAY, branch[:20].ljust(21))}"
                   f"  {session_cost(s)}  {c(GRAY, str(s['messages']) + ' turns')}"
@@ -609,12 +644,17 @@ def main():
     ap.add_argument("--interval", type=int, default=15,  help="Refresh interval in seconds (default: 15)")
     ap.add_argument("--project",  type=str, default=None, help="Filter to project substring")
     ap.add_argument("--all-time", action="store_true",   help="Include all sessions (not just last 30 days)")
+    ap.add_argument("--tasks",    action="store_true",
+                    help="Show each session's first prompt in TOP RUNS (off by default: it is private text)")
+    ap.add_argument("--redact",   action="store_true",
+                    help="Replace prompt text and branch names with short hashes (for screenshots)")
     ap.add_argument("--config",   type=str, default=None,
                     help=f"Config file (default: {default_config_path()})")
     args = ap.parse_args()
 
-    global CONFIG
+    global CONFIG, REDACT
     CONFIG = load_config(args.config)
+    REDACT = args.redact
 
     projects_dir = Path.home() / ".claude" / "projects"
     if not projects_dir.exists():

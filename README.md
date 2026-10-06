@@ -1,94 +1,139 @@
-# codeburn
+# burn
 
-Terminal dashboard for monitoring Claude Code agent token usage and costs. Reads session logs written by Claude Code locally — no network calls, no API keys.
+Terminal dashboard for Claude Code token usage and cost. It reads the session
+logs Claude Code already writes on your machine and shows what each project,
+session, model and day cost. No network calls, no API keys, nothing leaves
+your computer.
+
+> **Name note.** An unrelated public package called `codeburn` exists. This
+> project is not affiliated with it and is published as **`burn-cli`**.
 
 ## Requirements
 
-- Python 3.6+
-- Claude Code installed (session logs at `~/.claude/projects/`)
+- Python 3.8+ (no third-party dependencies)
+- Claude Code, with session logs under `~/.claude/projects/`
 
 ## Installation
 
 ```bash
-cp codeburn ~/.local/bin/codeburn
-chmod +x ~/.local/bin/codeburn
+pipx install burn-cli        # or: pip install burn-cli
 ```
 
-Or symlink so edits to the repo are reflected immediately:
+From a checkout:
 
 ```bash
-ln -sf ~/git/codeburn/codeburn ~/.local/bin/codeburn
+pip install .                      # installs the `burn` command
+# or run without installing:
+python -m burn_cli
+ln -sf "$PWD/bin/burn" ~/.local/bin/burn
 ```
 
 ## Usage
 
 ```
-codeburn [options]
+burn [options]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--days N` | 7 | Days of history shown in the daily chart |
 | `--sessions` | off | Add a per-session breakdown sorted by cost |
+| `--limit N` | 30 | Max sessions shown with `--sessions` |
 | `--watch` / `-w` | off | Auto-refresh the dashboard |
 | `--interval N` | 15 | Refresh interval in seconds (with `--watch`) |
-| `--project NAME` | all | Filter to sessions whose project path contains NAME |
+| `--project NAME` | all | Filter to sessions whose project name contains NAME |
 | `--all-time` | off | Include all sessions (default window is 30 days) |
+| `--config PATH` | `~/.config/burn/config.json` | Optional config file (see below) |
 
 ### Examples
 
 ```bash
-# Default view — last 7 days
-codeburn
-
-# Live dashboard, refresh every 10s
-codeburn --watch --interval 10
-
-# Show every session, sorted by cost
-codeburn --sessions --all-time
-
-# Zoom in on a specific project
-codeburn --project flutter --sessions
-
-# Plain text output (pipe-friendly)
-NO_COLOR=1 codeburn
+burn                              # last 7 days
+burn --watch --interval 10        # live dashboard
+burn --sessions --all-time        # every session, most expensive first
+burn --project flutter --sessions # one project
+NO_COLOR=1 burn | less            # plain text; stdout is the only data stream
 ```
 
 ## Output sections
 
-**ACTIVE** — Sessions whose log file was modified in the last 10 minutes, showing project, branch, cumulative session cost, age, and model.
+**ACTIVE** — sessions whose log was modified in the last 10 minutes: project,
+branch, cumulative cost, age, model.
 
-**TODAY** — Per-project cost bar chart for the current UTC day, with total tokens, cache hit rate, and output token count.
+**TODAY** — per-project cost bars for the current UTC day with total tokens,
+cache hit rate and output tokens. If any model had no pricing, an explicit
+`⚠ … tokens unpriced` line names it and the total is marked `+?`.
 
-**LAST N DAYS** — Daily cost bar chart. Costs are colour-coded: green < $1, yellow < $5, orange < $20, red $20+.
+**TOP RUNS** — most expensive sessions in the last 7 days and in the whole
+scanned window.
 
-**ALL SESSIONS** — (with `--sessions`) Top 30 sessions by cost, showing date, project, branch, cost, turn count, and model.
+**LAST N DAYS** — daily cost bars. Green < $1, yellow < $5, orange < $20,
+red ≥ $20.
+
+**ALL SESSIONS** — with `--sessions`: date, project, branch, cost, turns, model.
 
 ## How costs are calculated
 
-Each Claude Code session logs token usage in a `.jsonl` file per API turn. codeburn sums four token buckets per assistant turn and multiplies by the per-model rate:
+Claude Code logs one JSONL line per content block of an assistant message
+and repeats the message's `usage` on each line. burn counts each
+message once (deduplicated on `message.id` + `requestId`) and prices five
+buckets per message:
 
-| Bucket | Field in log |
-|---|---|
-| Fresh input | `input_tokens` |
-| Cache write | `cache_creation_input_tokens` |
-| Cache read | `cache_read_input_tokens` |
-| Output | `output_tokens` |
+| Bucket | Field in log | Rate |
+|---|---|---|
+| Fresh input | `input_tokens` | `input` |
+| Cache write, 5 min | `cache_creation.ephemeral_5m_input_tokens` | `cache_write` |
+| Cache write, 1 hour | `cache_creation.ephemeral_1h_input_tokens` | `cache_write_1h` (2× `cache_write` if absent) |
+| Cache read | `cache_read_input_tokens` | `cache_read` |
+| Output | `output_tokens` | `output` |
 
-Pricing table ($/million tokens, as of April 2026):
+Rates live in `burn_cli/pricing.json` ($ per million tokens) and are
+refreshed with `./update-pricing`, which fetches a pinned commit of LiteLLM's
+price table, prints a diff and asks before writing (`--yes` to skip the
+prompt). There is **no fallback rate**: a model missing from the table is
+counted but reported as *unpriced*, with a one-time warning on stderr, so a
+dollar figure is never silently wrong. The pseudo-model `<synthetic>` that
+Claude Code logs for local turns is zero-cost.
 
-| Model | Input | Output | Cache write | Cache read |
-|---|---|---|---|---|
-| claude-opus-4-6 | $15.00 | $75.00 | $18.75 | $1.50 |
-| claude-sonnet-4-6 | $3.00 | $15.00 | $3.75 | $0.30 |
-| claude-haiku-4-5 | $0.80 | $4.00 | $1.00 | $0.08 |
+## Config file
 
-Unknown models fall back to the Sonnet rate. Update `PRICING` in the script when Anthropic publishes new models or rates.
+`~/.config/burn/config.json` (or `--config PATH`) is optional:
 
-## Color support
+```json
+{
+  "project_map": [
+    { "pattern": "^org/(.*)-feature-.*$", "replace": "org/\\1" }
+  ]
+}
+```
 
-Colors are automatically disabled when stdout is not a TTY or when `NO_COLOR` is set (the [no-color.org](https://no-color.org) convention). Pipe output or set `NO_COLOR=1` for plain text.
+`project_map` rules are regexes applied to the derived project name
+(`<parent-dir>/<repo>`); the first rule that changes the name wins. Claude
+Code's `.claude/worktrees/<name>` directories and sibling worktrees named
+`<repo>-<id>-wt` are folded into their parent project automatically.
 
-## Data source
+## Colour and streams
 
-Session logs live at `~/.claude/projects/<project-slug>/<session-id>.jsonl`. Each line is a JSON object. codeburn reads only the metadata fields (`timestamp`, `usage`, `model`, `cwd`, `gitBranch`) — it never reads or displays message content.
+Colours are disabled when stdout is not a TTY or `NO_COLOR` is set
+([no-color.org](https://no-color.org)). The dashboard is written to stdout
+only; warnings go to stderr.
+
+## Data source and privacy
+
+Session logs live at `~/.claude/projects/<project-slug>/<session-id>.jsonl`.
+burn reads metadata fields only (`timestamp`, `usage`, `model`, `cwd`,
+`gitBranch`, message and request ids) and never stores or transmits message
+content.
+
+## Development
+
+```bash
+python3 -m unittest -q
+```
+
+Tests use hand-built synthetic fixtures in `tests/`. Never commit a real
+session log.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -33,7 +33,7 @@ def make_projects(tmp, now):
 
 def default_args(**over):
     base = dict(days=7, sessions=False, limit=30, watch=False, interval=15,
-                project=None, all_time=False, config=None)
+                project=None, all_time=False, config=None, tasks=False, redact=False)
     base.update(over)
     return argparse.Namespace(**base)
 
@@ -63,6 +63,43 @@ class RenderStreams(unittest.TestCase):
             with contextlib.redirect_stdout(out):
                 cb.render(sessions, default_args())
         self.assertNotIn("\x1b", out.getvalue())
+
+
+class PromptPrivacy(unittest.TestCase):
+    def render(self, **over):
+        now = datetime.now(tz=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_projects(tmp, now)
+            sessions = cb.parse_sessions(root)
+            out = io.StringIO()
+            cb.REDACT = over.pop("redact", False)
+            try:
+                with contextlib.redirect_stdout(out):
+                    cb.render(sessions, default_args(sessions=True, redact=cb.REDACT, **over))
+            finally:
+                cb.REDACT = False
+        return out.getvalue()
+
+    def test_prompt_text_hidden_by_default(self):
+        text = self.render()
+        self.assertNotIn("Please do the", text)
+        self.assertIn("[feat/x-1-login]", text)
+
+    def test_tasks_flag_shows_prompt_text(self):
+        text = self.render(tasks=True)
+        self.assertIn("Please do the active task", text)
+
+    def test_redact_hashes_prompts_and_branches(self):
+        text = self.render(tasks=True, redact=True)
+        self.assertNotIn("Please do the", text)
+        self.assertNotIn("feat/x-1-login", text)
+        self.assertIn(cb.redact("feat/x-1-login"), text)
+        self.assertIn(cb.redact("Please do the active task"), text)
+
+    def test_redact_is_stable_and_short(self):
+        self.assertEqual(cb.redact("abc"), cb.redact("abc"))
+        self.assertRegex(cb.redact("abc"), r"^#[0-9a-f]{8}$")
+        self.assertIsNone(cb.redact(None))
 
 
 if __name__ == "__main__":
