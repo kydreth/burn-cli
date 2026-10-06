@@ -65,6 +65,36 @@ class RenderStreams(unittest.TestCase):
         self.assertNotIn("\x1b", out.getvalue())
 
 
+class ModelTable(unittest.TestCase):
+    def test_models_section_lists_models_and_unpriced_row(self):
+        now = datetime.now(tz=timezone.utc)
+        cb._warned_models.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_projects(tmp, now)
+            recs = assistant_lines(now - timedelta(minutes=5), "claude-unknown-9", USAGE, "mu", "ru",
+                                   cwd="/home/dev/git/demo", session="unk")
+            path = write_jsonl(root / "-home-dev-git-demo" / "unk.jsonl", recs)
+            touch(path, now)
+            with contextlib.redirect_stderr(io.StringIO()):
+                sessions = cb.parse_sessions(root)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cb.render(sessions, default_args())
+        text = out.getvalue()
+        self.assertIn("MODELS — LAST 7 DAYS", text)
+        self.assertIn("claude-sonnet-4-6", text)
+        self.assertRegex(text, r"unpriced\s+1\s+3K\s+—\s+claude-unknown-9")
+
+    def test_models_in_window_respects_days(self):
+        now = datetime.now(tz=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = cb.parse_sessions(make_projects(tmp, now))
+        week = cb.models_in_window(sessions, now, 7)
+        today = cb.models_in_window(sessions, now, 1)
+        self.assertEqual(week["claude-sonnet-4-6"]["messages"], 3)
+        self.assertEqual(today["claude-sonnet-4-6"]["messages"], 2)
+
+
 class PromptPrivacy(unittest.TestCase):
     def render(self, **over):
         now = datetime.now(tz=timezone.utc)

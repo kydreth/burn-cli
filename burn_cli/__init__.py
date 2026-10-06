@@ -321,8 +321,7 @@ def _parse_jsonl(path, proj_slug, since):
         return None
 
     total = new_bucket()
-    days = defaultdict(new_bucket)    # "YYYY-MM-DD" -> bucket (day of each turn)
-    models = defaultdict(new_bucket)  # model -> bucket
+    day_models = defaultdict(new_bucket)  # ("YYYY-MM-DD", model) -> bucket, per turn
     turns = []                        # (epoch, cost) for recent turns, for burn rate
     turns_cutoff = time.time() - RECENT_TURNS_SECONDS
     unpriced_models = set()
@@ -417,9 +416,9 @@ def _parse_jsonl(path, proj_slug, since):
                         if msg_cost is None:
                             unpriced_models.add(turn_model)
                         bucket_add_usage(total, usage, msg_cost, uncached)
-                        bucket_add_usage(models[turn_model], usage, msg_cost, uncached)
                         day_ts = last_ts or mtime
-                        bucket_add_usage(days[day_ts.strftime("%Y-%m-%d")], usage, msg_cost, uncached)
+                        bucket_add_usage(day_models[(day_ts.strftime("%Y-%m-%d"), turn_model)],
+                                         usage, msg_cost, uncached)
                         epoch = day_ts.timestamp()
                         if epoch >= turns_cutoff:
                             turns.append((epoch, msg_cost or 0.0))
@@ -438,6 +437,11 @@ def _parse_jsonl(path, proj_slug, since):
 
     # Dominant model = whichever had the most turns (most representative for display)
     dominant_model = max(model_turns, key=model_turns.__getitem__) if model_turns else "unknown"
+
+    days, models = defaultdict(new_bucket), defaultdict(new_bucket)
+    for (day, model), b in day_models.items():
+        bucket_merge(days[day], b)
+        bucket_merge(models[model], b)
 
     proj = project_name(cwd, proj_slug)
     return {
@@ -464,6 +468,7 @@ def _parse_jsonl(path, proj_slug, since):
         "unpriced_models":      sorted(unpriced_models),
         "days":                 dict(days),
         "models":               dict(models),
+        "day_models":           dict(day_models),
         "turns":                turns,
     }
 
@@ -511,13 +516,24 @@ def header(label):
     print(c(BOLD + CYAN, f"\n  {label}"))
     print(c(GRAY, "  " + "─" * 64))
 
-def model_badge(m):
+def _model_color(m):
+    if "fable" in m or "mythos" in m:
+        return RED
     if "opus" in m:
-        return c(PURPLE, "opus")
+        return PURPLE
     if "sonnet" in m:
-        return c(BLUE, "sonnet")
+        return BLUE
     if "haiku" in m:
-        return c(GREEN, "haiku")
+        return GREEN
+    return GRAY
+
+def model_badge(m, width=None):
+    """Short family badge ("opus") or, with `width`, the padded full model id."""
+    if width:
+        return c(_model_color(m), m[:width].ljust(width))
+    for family in ("fable", "mythos", "opus", "sonnet", "haiku"):
+        if family in m:
+            return c(_model_color(m), family)
     return c(GRAY, m[:10])
 
 def _render_top_run(s, show_tasks):
@@ -531,6 +547,34 @@ def _render_top_run(s, show_tasks):
     detail_str = c(GRAY, (detail[:46] + "…" if len(detail) > 47 else detail.ljust(47)))
     turns = c(GRAY, f"{s['messages']}t".rjust(5))
     print(f"  {c(GRAY, day)}  {proj}  {detail_str}  {session_cost(s)}  {turns}  {model_badge(s['model'])}")
+
+
+def models_in_window(sessions, now, days):
+    """Aggregate per-model buckets over turns in the last `days` UTC days."""
+    cutoff = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    out = defaultdict(new_bucket)
+    for s in sessions:
+        for (day, model), b in s["day_models"].items():
+            if day >= cutoff:
+                bucket_merge(out[model], b)
+    return dict(out)
+
+def render_model_table(by_model):
+    priced = {m: b for m, b in by_model.items() if not b["unpriced"] or b["cost"]}
+    unpriced_models = sorted(m for m, b in by_model.items() if b["unpriced"])
+    total_cost = sum(b["cost"] for b in by_model.values()) or 1.0
+    print(c(GRAY, f"  {'model':26}  {'msgs':>6}  {'tokens':>7}  {'cost':>8}  share"))
+    for m, b in sorted(priced.items(), key=lambda kv: -kv[1]["cost"]):
+        share = b["cost"] / total_cost * 100
+        print(f"  {model_badge(m, width=26)}  {c(GRAY, str(b['messages']).rjust(6))}"
+              f"  {c(GRAY, fmt_tokens(bucket_tokens(b)).rjust(7))}  {fmt_cost(b['cost']).rjust(8)}"
+              f"  {c(PURPLE, bar(b['cost'], total_cost, 12))} {share:3.0f}%")
+    if unpriced_models:
+        toks = sum(by_model[m]["unpriced"] for m in unpriced_models)
+        msgs = sum(by_model[m]["messages"] for m in unpriced_models)
+        print(f"  {c(RED, 'unpriced'.ljust(26))}  {c(GRAY, str(msgs).rjust(6))}"
+              f"  {c(GRAY, fmt_tokens(toks).rjust(7))}  {c(RED, '—'.rjust(8))}"
+              f"  {c(GRAY, ', '.join(unpriced_models))}")
 
 
 # ── Render functions ──────────────────────────────────────────────────────────
@@ -606,6 +650,12 @@ def render(sessions, args):
             models = sorted({m for s in today_sessions for m in s["unpriced_models"]})
             print(c(RED, f"  ⚠ {fmt_tokens(total_unpriced)} tokens unpriced ({', '.join(models)}) — "
                          f"total is a lower bound; run ./update-pricing"))
+
+    # ── Per-model table (same window as LAST N DAYS) ──────────────────────────
+    by_model = models_in_window(sessions, now, args.days)
+    if by_model:
+        header(f"MODELS — LAST {args.days} DAYS")
+        render_model_table(by_model)
 
     # ── Top runs — last 7 days ─────────────────────────────────────────────────
     week_sessions = [s for s in sessions if s["last_ts"] >= seven_days_ago]
