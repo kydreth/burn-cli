@@ -33,7 +33,8 @@ def make_projects(tmp, now):
 
 def default_args(**over):
     base = dict(days=7, sessions=False, limit=30, watch=False, interval=15,
-                project=None, all_time=False, config=None, tasks=False, redact=False)
+                project=None, all_time=False, config=None, tasks=False, redact=False,
+                budget=None)
     base.update(over)
     return argparse.Namespace(**base)
 
@@ -93,6 +94,39 @@ class ModelTable(unittest.TestCase):
         today = cb.models_in_window(sessions, now, 1)
         self.assertEqual(week["claude-sonnet-4-6"]["messages"], 3)
         self.assertEqual(today["claude-sonnet-4-6"]["messages"], 2)
+
+
+class BurnRateAndBudget(unittest.TestCase):
+    def test_burn_rate_counts_only_last_hour(self):
+        now = datetime.now(tz=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = cb.parse_sessions(make_projects(tmp, now))
+        active = [s for s in sessions if s["id"] == "active"]
+        earlier = [s for s in sessions if s["id"] == "earlier"]
+        self.assertAlmostEqual(cb.burn_rate(active, now), active[0]["cost"])  # 1 msg in last 60 min
+        self.assertEqual(cb.burn_rate(earlier, now), 0.0)                      # 3 h ago
+        self.assertAlmostEqual(cb.burn_rate(sessions, now, minutes=30), active[0]["cost"] * 2)
+
+    def test_projection_adds_rate_for_hours_left(self):
+        now = datetime(2026, 1, 10, 12, 0, tzinfo=timezone.utc)
+        self.assertAlmostEqual(cb.projected_end_of_day(10.0, 2.0, now), 10.0 + 2.0 * (11 + 59 / 60 + 59 / 3600))
+        self.assertAlmostEqual(cb.projected_end_of_day(5.0, 0.0, now), 5.0)
+
+    def test_budget_exit_code_and_message(self):
+        now = datetime.now(tz=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = cb.parse_sessions(make_projects(tmp, now))
+        today = now.strftime("%Y-%m-%d")
+        spent = cb.today_total_cost(sessions, today)
+        self.assertGreater(spent, 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            over = cb.render(sessions, default_args(budget=spent / 2))
+            under = cb.render(sessions, default_args(budget=spent * 2))
+            none = cb.render(sessions, default_args())
+        self.assertEqual((over, under, none), (1, 0, 0))
+        self.assertIn("BUDGET EXCEEDED", out.getvalue())
+        self.assertIn("BURN RATE", out.getvalue())
 
 
 class PromptPrivacy(unittest.TestCase):

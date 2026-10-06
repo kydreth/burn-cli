@@ -554,6 +554,21 @@ def _render_top_run(s, show_tasks):
     print(f"  {c(GRAY, day)}  {proj}  {detail_str}  {session_cost(s)}  {turns}  {model_badge(s['model'])}")
 
 
+def burn_rate(sessions, now, minutes=60):
+    """USD spent in the last `minutes` across `sessions`, expressed per hour."""
+    cutoff = now.timestamp() - minutes * 60
+    spent = sum(cost for s in sessions for epoch, cost in s["turns"] if epoch >= cutoff)
+    return spent * 60.0 / minutes
+
+def projected_end_of_day(today_total, rate_per_hour, now):
+    """Today's spend so far plus the current burn rate for the rest of the UTC day."""
+    end = now.replace(hour=23, minute=59, second=59, microsecond=0)
+    hours_left = max(0.0, (end - now).total_seconds() / 3600.0)
+    return today_total + rate_per_hour * hours_left
+
+def today_total_cost(sessions, today_str):
+    return sum(s["days"][today_str]["cost"] for s in sessions if today_str in s["days"])
+
 def models_in_window(sessions, now, days):
     """Aggregate per-model buckets over turns in the last `days` UTC days."""
     cutoff = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
@@ -614,7 +629,9 @@ def render(sessions, args):
             age = fmt_age(s["mtime"])
             proj_str = c(WHITE, s["project"][:35].ljust(36))
             branch_str = c(GRAY, branch[:20].ljust(21))
-            print(f"  {proj_str}{branch_str}  {session_cost(s)}  {c(GRAY, age.rjust(7))}  {model_badge(s['model'])}")
+            rate = burn_rate([s], now)
+            rate_str = c(ORANGE if rate >= 20 else GRAY, f"${rate:,.2f}/h".rjust(10))
+            print(f"  {proj_str}{branch_str}  {session_cost(s)}  {rate_str}  {c(GRAY, age.rjust(7))}  {model_badge(s['model'])}")
         hidden = len(active) - MAX_ACTIVE
         if hidden > 0:
             print(c(GRAY, f"  + {hidden} more active"))
@@ -656,6 +673,10 @@ def render(sessions, args):
             models = sorted({m for s in today_sessions for m in s["unpriced_models"]})
             print(c(RED, f"  ⚠ {fmt_tokens(total_unpriced)} tokens unpriced ({', '.join(models)}) — "
                          f"total is a lower bound; run ./update-pricing"))
+        rate = burn_rate(sessions, now)
+        projected = projected_end_of_day(total_cost, rate, now)
+        print(f"  {c(BOLD, 'BURN RATE:')}   {c(ORANGE if rate >= 20 else WHITE, f'${rate:,.2f}/h')} "
+              f"{c(GRAY, '(last 60 min)')}   projected end of day: {fmt_cost(projected, total_unpriced, 0)}")
 
     # ── Per-model table (same window as LAST N DAYS) ──────────────────────────
     by_model = models_in_window(sessions, now, args.days)
@@ -724,6 +745,22 @@ def render(sessions, args):
         print(c(GRAY, f"  Refreshing every {args.interval}s  ·  Ctrl+C to quit"))
     print()
 
+    return budget_status(sessions, args, today_str)
+
+
+def budget_status(sessions, args, today_str, quiet=False):
+    """Return 1 (and print a red line unless quiet) when today's spend exceeds --budget."""
+    budget = getattr(args, "budget", None)
+    if budget is None:
+        return 0
+    today = today_total_cost(sessions, today_str)
+    if today > budget:
+        if not quiet:
+            print(c(RED + BOLD, f"  ⚠ BUDGET EXCEEDED: ${today:,.2f} spent today, budget is ${budget:,.2f}"))
+            print()
+        return 1
+    return 0
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
@@ -744,6 +781,8 @@ def main():
                     help="Show each session's first prompt in TOP RUNS (off by default: it is private text)")
     ap.add_argument("--redact",   action="store_true",
                     help="Replace prompt text and branch names with short hashes (for screenshots)")
+    ap.add_argument("--budget",   type=float, default=None, metavar="USD",
+                    help="Exit 1 and print a warning when today's spend exceeds USD (for cron/launchd)")
     ap.add_argument("--config",   type=str, default=None,
                     help=f"Config file (default: {default_config_path()})")
     args = ap.parse_args()
@@ -770,7 +809,7 @@ def main():
         sessions = parse_sessions(projects_dir, since=since, cache=session_cache)
         if args.project:
             sessions = [s for s in sessions if args.project.lower() in s["project"].lower()]
-        render(sessions, args)
+        return render(sessions, args)
 
     if args.watch:
         try:
@@ -780,7 +819,7 @@ def main():
         except KeyboardInterrupt:
             print()
     else:
-        load_and_render()
+        sys.exit(load_and_render())
 
 
 if __name__ == "__main__":
