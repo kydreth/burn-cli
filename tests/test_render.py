@@ -34,7 +34,7 @@ def make_projects(tmp, now):
 def default_args(**over):
     base = dict(days=7, sessions=False, limit=30, watch=False, interval=15,
                 project=None, all_time=False, config=None, tasks=False, redact=False,
-                budget=None)
+                budget=None, since=None, json=False)
     base.update(over)
     return argparse.Namespace(**base)
 
@@ -127,6 +127,74 @@ class BurnRateAndBudget(unittest.TestCase):
         self.assertEqual((over, under, none), (1, 0, 0))
         self.assertIn("BUDGET EXCEEDED", out.getvalue())
         self.assertIn("BURN RATE", out.getvalue())
+
+
+class JsonReport(unittest.TestCase):
+    def test_json_is_the_only_stdout_and_sums_agree(self):
+        import json as _json
+        now = datetime.now(tz=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = cb.parse_sessions(make_projects(tmp, now))
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = cb.render_json(sessions, default_args(json=True, budget=1000))
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        report = _json.loads(out.getvalue())
+        self.assertEqual(len(report["sessions"]), 3)
+        self.assertEqual({p["project"] for p in report["projects"]}, {"git/demo", "git/other"})
+        total = sum(s["cost"] for s in report["sessions"])
+        self.assertAlmostEqual(sum(d["cost"] for d in report["days"]), total, places=5)
+        self.assertAlmostEqual(sum(m["cost"] for m in report["models"]), total, places=5)
+        self.assertAlmostEqual(report["today"]["cost"], total * 2 / 3, places=5)
+        self.assertFalse(report["today"]["budget_exceeded"])
+        self.assertNotIn("first_task", report["sessions"][0])   # private by default
+        self.assertEqual(report["sessions"][0]["model"], "claude-sonnet-4-6")
+
+    def test_json_budget_exit_and_tasks_redacted(self):
+        import json as _json
+        now = datetime.now(tz=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = cb.parse_sessions(make_projects(tmp, now))
+            out = io.StringIO()
+            cb.REDACT = True
+            try:
+                with contextlib.redirect_stdout(out):
+                    code = cb.render_json(sessions, default_args(json=True, budget=0.0000001, tasks=True))
+            finally:
+                cb.REDACT = False
+        report = _json.loads(out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertTrue(report["today"]["budget_exceeded"])
+        self.assertTrue(all(s["first_task"].startswith("#") for s in report["sessions"]))
+        self.assertTrue(all(s["branch"].startswith("#") for s in report["sessions"]))
+
+    def test_restrict_sessions_drops_turns_before_since(self):
+        now = datetime.now(tz=timezone.utc)
+        old = now - timedelta(days=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            recs = assistant_lines(old, "claude-sonnet-4-6", USAGE, "m-old", "r-old", session="long")
+            recs += assistant_lines(now - timedelta(hours=1), "claude-sonnet-4-6", USAGE, "m-new", "r-new", session="long")
+            path = write_jsonl(root / "-home-dev-git-demo" / "long.jsonl", recs)
+            touch(path, now)
+            [s] = cb.parse_sessions(root)
+            self.assertEqual(s["messages"], 2)
+            [r] = cb.restrict_sessions([s], now - timedelta(days=2))
+        self.assertEqual(r["messages"], 1)
+        self.assertAlmostEqual(r["cost"], s["cost"] / 2)
+        self.assertEqual(len(r["days"]), 1)
+        self.assertEqual(cb.restrict_sessions([s], None), [s])
+        self.assertEqual(cb.restrict_sessions([s], now + timedelta(days=1)), [])
+
+    def test_since_filters_old_sessions(self):
+        now = datetime.now(tz=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = make_projects(tmp, now)
+            all_sessions = cb.parse_sessions(root)
+            recent = cb.parse_sessions(root, since=now - timedelta(days=2))
+        self.assertEqual(len(all_sessions), 3)
+        self.assertEqual({s["id"] for s in recent}, {"active", "earlier"})
 
 
 class PromptPrivacy(unittest.TestCase):

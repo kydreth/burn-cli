@@ -472,6 +472,41 @@ def _parse_jsonl(path, proj_slug, since):
         "turns":                turns,
     }
 
+def restrict_sessions(sessions, since):
+    """Drop turns before `since` (day granularity) so every figure describes the
+    requested window, even for long-lived sessions that started earlier."""
+    if since is None:
+        return sessions
+    cutoff = since.strftime("%Y-%m-%d")
+    out = []
+    for s in sessions:
+        if all(day >= cutoff for day, _ in s["day_models"]):
+            out.append(s)
+            continue
+        kept = {k: b for k, b in s["day_models"].items() if k[0] >= cutoff}
+        if not kept:
+            continue
+        total, days, models = new_bucket(), defaultdict(new_bucket), defaultdict(new_bucket)
+        for (day, model), b in kept.items():
+            bucket_merge(total, b)
+            bucket_merge(days[day], b)
+            bucket_merge(models[model], b)
+        r = dict(s)
+        r.update({
+            "day_models": kept, "days": dict(days), "models": dict(models),
+            "messages": total["messages"],
+            "input_tokens": total["input"], "output_tokens": total["output"],
+            "cache_creation_tokens": total["cache_create"],
+            "cache_creation_1h_tokens": total["cache_create_1h"],
+            "cache_read_tokens": total["cache_read"],
+            "cost": total["cost"], "uncached_cost": total["uncached_cost"],
+            "unpriced_tokens": total["unpriced"],
+            "unpriced_models": sorted(m for m, b in models.items() if b["unpriced"]),
+            "turns": [t for t in s["turns"] if t[0] >= since.timestamp()],
+        })
+        out.append(r)
+    return out
+
 # ── Display helpers ───────────────────────────────────────────────────────────
 UNPRICED_MARK = "+?"  # appended to a cost when some of its tokens had no pricing
 
@@ -695,7 +730,12 @@ def render(sessions, args):
     # ── Top runs — all scanned ─────────────────────────────────────────────────
     if sessions:
         top_all = sorted(sessions, key=lambda s: -s["cost"])[:TOP_RUNS]
-        window_label = "ALL TIME" if args.all_time else "ALL SCANNED (30d)"
+        if getattr(args, "since", None):
+            window_label = f"SINCE {args.since}"
+        elif args.all_time:
+            window_label = "ALL TIME"
+        else:
+            window_label = "ALL SCANNED (30d)"
         header(f"TOP RUNS — {window_label}")
         for s in top_all:
             _render_top_run(s, args.tasks)
@@ -739,7 +779,12 @@ def render(sessions, args):
     total_all = sum(s["cost"] for s in sessions)
     unpriced_all = sum(s["unpriced_tokens"] for s in sessions)
     print()
-    window = "all time" if args.all_time else f"last {max(args.days, 30)}d"
+    if getattr(args, "since", None):
+        window = f"since {args.since}"
+    elif args.all_time:
+        window = "all time"
+    else:
+        window = f"last {max(args.days, 30)}d"
     print(c(GRAY, f"  {len(sessions)} sessions scanned ({window})  ·  total: ") + fmt_cost(total_all, unpriced_all, 0))
     if args.watch:
         print(c(GRAY, f"  Refreshing every {args.interval}s  ·  Ctrl+C to quit"))
@@ -762,6 +807,88 @@ def budget_status(sessions, args, today_str, quiet=False):
     return 0
 
 
+# ── JSON report ───────────────────────────────────────────────────────────────
+def _iso(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if dt else None
+
+def _bucket_out(b):
+    out = {
+        "input_tokens": b["input"], "output_tokens": b["output"],
+        "cache_write_tokens": b["cache_create"], "cache_write_1h_tokens": b["cache_create_1h"],
+        "cache_read_tokens": b["cache_read"], "messages": b["messages"],
+        "cost": round(b["cost"], 6), "uncached_cost": round(b["uncached_cost"], 6),
+        "unpriced_tokens": b["unpriced"],
+    }
+    return out
+
+def session_out(s, show_tasks):
+    out = {
+        "id": s["id"],
+        "project": s["project"],
+        "branch": display_branch(s),
+        "model": s["model"],
+        "start": _iso(s["start_ts"]),
+        "last": _iso(s["last_ts"]),
+        "messages": s["messages"],
+        "input_tokens": s["input_tokens"],
+        "output_tokens": s["output_tokens"],
+        "cache_write_tokens": s["cache_creation_tokens"],
+        "cache_write_1h_tokens": s["cache_creation_1h_tokens"],
+        "cache_read_tokens": s["cache_read_tokens"],
+        "cost": round(s["cost"], 6),
+        "uncached_cost": round(s["uncached_cost"], 6),
+        "unpriced_tokens": s["unpriced_tokens"],
+        "unpriced_models": s["unpriced_models"],
+        "models": {m: _bucket_out(b) for m, b in sorted(s["models"].items())},
+    }
+    if show_tasks:
+        out["first_task"] = display_task(s)
+    return out
+
+def build_report(sessions, args, now=None, since=None):
+    """Machine-readable equivalent of the dashboard (per session, project, day, model)."""
+    now = now or datetime.now(tz=timezone.utc)
+    today_str = now.strftime("%Y-%m-%d")
+
+    by_proj, by_day, by_model = defaultdict(new_bucket), defaultdict(new_bucket), defaultdict(new_bucket)
+    proj_sessions = defaultdict(int)
+    for s in sessions:
+        proj_sessions[s["project"]] += 1
+        for (day, model), b in s["day_models"].items():
+            bucket_merge(by_proj[s["project"]], b)
+            bucket_merge(by_day[day], b)
+            bucket_merge(by_model[model], b)
+
+    today_cost = today_total_cost(sessions, today_str)
+    rate = burn_rate(sessions, now)
+    budget = getattr(args, "budget", None)
+    return {
+        "generated_at": _iso(now),
+        "window": {"since": _iso(since), "days": args.days, "all_time": bool(args.all_time)},
+        "today": {
+            "date": today_str,
+            "cost": round(today_cost, 6),
+            "unpriced_tokens": sum(s["days"][today_str]["unpriced"] for s in sessions if today_str in s["days"]),
+            "burn_rate_per_hour": round(rate, 6),
+            "projected_end_of_day": round(projected_end_of_day(today_cost, rate, now), 6),
+            "budget": budget,
+            "budget_exceeded": bool(budget is not None and today_cost > budget),
+        },
+        "sessions": [session_out(s, args.tasks) for s in sorted(sessions, key=lambda x: -x["cost"])],
+        "projects": [dict(project=p, sessions=proj_sessions[p], **_bucket_out(b))
+                     for p, b in sorted(by_proj.items(), key=lambda kv: -kv[1]["cost"])],
+        "days": [dict(date=d, **_bucket_out(b)) for d, b in sorted(by_day.items())],
+        "models": [dict(model=m, **_bucket_out(b))
+                   for m, b in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"])],
+    }
+
+def render_json(sessions, args, since=None):
+    report = build_report(sessions, args, since=since)
+    json.dump(report, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 1 if report["today"]["budget_exceeded"] else 0
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
@@ -777,6 +904,9 @@ def main():
     ap.add_argument("--interval", type=int, default=15,  help="Refresh interval in seconds (default: 15)")
     ap.add_argument("--project",  type=str, default=None, help="Filter to project substring")
     ap.add_argument("--all-time", action="store_true",   help="Include all sessions (not just last 30 days)")
+    ap.add_argument("--since",    type=str, default=None, metavar="YYYY-MM-DD",
+                    help="Only sessions active on/after this UTC date (overrides the 30-day window)")
+    ap.add_argument("--json",     action="store_true",   help="Print a JSON report instead of the dashboard")
     ap.add_argument("--tasks",    action="store_true",
                     help="Show each session's first prompt in TOP RUNS (off by default: it is private text)")
     ap.add_argument("--redact",   action="store_true",
@@ -796,9 +926,18 @@ def main():
         print(f"No Claude projects directory found at {projects_dir}", file=sys.stderr)
         sys.exit(1)
 
-    since = None if args.all_time else (
-        datetime.now(tz=timezone.utc) - timedelta(days=max(args.days, 30))
-    )
+    if args.since:
+        try:
+            since = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            ap.error("--since expects YYYY-MM-DD")
+    elif args.all_time:
+        since = None
+    else:
+        since = datetime.now(tz=timezone.utc) - timedelta(days=max(args.days, 30))
+
+    if args.json and args.watch:
+        ap.error("--json cannot be combined with --watch")
 
     if args.interval != 15 and not args.watch:
         print("warning: --interval has no effect without --watch", file=sys.stderr)
@@ -806,9 +945,11 @@ def main():
     session_cache = {} if args.watch else None
 
     def load_and_render():
-        sessions = parse_sessions(projects_dir, since=since, cache=session_cache)
+        sessions = restrict_sessions(parse_sessions(projects_dir, since=since, cache=session_cache), since)
         if args.project:
             sessions = [s for s in sessions if args.project.lower() in s["project"].lower()]
+        if args.json:
+            return render_json(sessions, args, since=since)
         return render(sessions, args)
 
     if args.watch:
