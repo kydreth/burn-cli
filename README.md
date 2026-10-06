@@ -1,13 +1,10 @@
-# burn
+# burn-cli
 
 Terminal dashboard for Claude Code token usage and cost. It reads the session
 logs Claude Code already writes on your machine and shows what each project,
 session, model, task and day cost, how fast you are spending right now, and
 how much prompt caching is saving you. No network calls, no API keys, nothing
 leaves your computer.
-
-> **Name note.** An unrelated public package called `codeburn` exists. This
-> project is not affiliated with it and is published as **`burn-cli`**.
 
 ## Requirements
 
@@ -17,7 +14,7 @@ leaves your computer.
 ## Installation
 
 ```bash
-pipx install burn-cli        # or: pip install burn-cli
+pipx install burn-cli              # or: pip install burn-cli
 ```
 
 From a checkout:
