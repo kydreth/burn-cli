@@ -197,6 +197,40 @@ class JsonReport(unittest.TestCase):
         self.assertEqual({s["id"] for s in recent}, {"active", "earlier"})
 
 
+class CacheEfficiency(unittest.TestCase):
+    def test_cache_stats(self):
+        b = cb.new_bucket()
+        b.update(input=100, cache_create=400, cache_create_1h=300, cache_read=1500, cost=2.0, uncached_cost=5.0)
+        st = cb.cache_stats(b)
+        self.assertAlmostEqual(st["hit_rate"], 1500 / 2000)
+        self.assertAlmostEqual(st["write_1h_share"], 0.75)
+        self.assertAlmostEqual(st["write_5m_share"], 0.25)
+        self.assertAlmostEqual(st["savings"], 3.0)
+        self.assertEqual(cb.cache_stats(cb.new_bucket())["hit_rate"], 0.0)
+
+    def test_cache_section_and_json(self):
+        import json as _json
+        now = datetime.now(tz=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            sessions = cb.parse_sessions(make_projects(tmp, now))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                cb.render(sessions, default_args(sessions=True))
+            jout = io.StringIO()
+            with contextlib.redirect_stdout(jout):
+                cb.render_json(sessions, default_args(json=True))
+        text = out.getvalue()
+        self.assertIn("CACHE — LAST 7 DAYS", text)
+        self.assertIn("hit rate 65%", text)        # 2000 / (100 + 1000 + 2000)
+        self.assertIn("100% 5m / 0% 1h", text)
+        self.assertIn("65% cached", text)          # per-session column
+        report = _json.loads(jout.getvalue())
+        self.assertAlmostEqual(report["cache"]["hit_rate"], 2000 / 3100, places=3)
+        s0 = report["sessions"][0]
+        self.assertGreater(s0["cache"]["savings"], 0)
+        self.assertAlmostEqual(s0["cache"]["uncached_cost"], s0["uncached_cost"])
+
+
 class PromptPrivacy(unittest.TestCase):
     def render(self, **over):
         now = datetime.now(tz=timezone.utc)

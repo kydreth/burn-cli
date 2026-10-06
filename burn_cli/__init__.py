@@ -648,6 +648,50 @@ def projected_end_of_day(today_total, rate_per_hour, now):
 def today_total_cost(sessions, today_str):
     return sum(s["days"][today_str]["cost"] for s in sessions if today_str in s["days"])
 
+def cache_stats(b):
+    """Cache efficiency for a bucket: hit rate, 1h share of writes, savings vs no cache."""
+    ctx = b["input"] + b["cache_create"] + b["cache_read"]
+    writes = b["cache_create"]
+    return {
+        "hit_rate": (b["cache_read"] / ctx) if ctx else 0.0,
+        "write_1h_share": (b["cache_create_1h"] / writes) if writes else 0.0,
+        "write_5m_share": ((writes - b["cache_create_1h"]) / writes) if writes else 0.0,
+        "cost": b["cost"],
+        "uncached_cost": b["uncached_cost"],
+        "savings": b["uncached_cost"] - b["cost"],
+    }
+
+def session_bucket(s):
+    """The session's totals as a bucket (sum of its day/model buckets)."""
+    b = new_bucket()
+    for part in s["day_models"].values():
+        bucket_merge(b, part)
+    return b
+
+def window_bucket(sessions, now, days):
+    cutoff = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    b = new_bucket()
+    for s in sessions:
+        for (day, _model), part in s["day_models"].items():
+            if day >= cutoff:
+                bucket_merge(b, part)
+    return b
+
+def render_cache_section(sessions, now, days):
+    b = window_bucket(sessions, now, days)
+    if not (b["cache_read"] or b["cache_create"]):
+        return
+    st = cache_stats(b)
+    header(f"CACHE — LAST {days} DAYS")
+    hit = f"{st['hit_rate'] * 100:.0f}%"
+    split = f"{st['write_5m_share'] * 100:.0f}% 5m / {st['write_1h_share'] * 100:.0f}% 1h"
+    print(f"  hit rate {c(GREEN, hit)} of context tokens served from cache"
+          f"   ·   writes {c(GRAY, split)}")
+    pct = (st["savings"] / st["uncached_cost"] * 100) if st["uncached_cost"] else 0.0
+    saved = f"${st['savings']:,.2f}"
+    print(f"  actual {fmt_cost(st['cost'], b['unpriced'], 0)}   without caching ≈ "
+          f"{fmt_cost(st['uncached_cost'], b['unpriced'], 0)}   saved {c(GREEN, saved)} ({pct:.0f}%)")
+
 def models_in_window(sessions, now, days):
     """Aggregate per-model buckets over turns in the last `days` UTC days."""
     cutoff = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
@@ -763,6 +807,9 @@ def render(sessions, args):
         header(f"MODELS — LAST {args.days} DAYS")
         render_model_table(by_model)
 
+    # ── Cache efficiency ──────────────────────────────────────────────────────
+    render_cache_section(sessions, now, args.days)
+
     # ── Top runs — last 7 days ─────────────────────────────────────────────────
     week_sessions = [s for s in sessions if s["last_ts"] >= seven_days_ago]
     if week_sessions:
@@ -817,9 +864,10 @@ def render(sessions, args):
             turns = f"{s['messages']}t"
             if s.get("subagents"):
                 turns += f" +{s['subagents']}ag"
+            hit = cache_stats(session_bucket(s))["hit_rate"] * 100
             print(f"  {c(GRAY, day)}  {c(WHITE, display_project(s)[:28].ljust(29))}"
                   f"  {c(GRAY, branch[:20].ljust(21))}"
-                  f"  {session_cost(s)}  {c(GRAY, turns.ljust(10))}"
+                  f"  {session_cost(s)}  {c(GRAY, turns.ljust(10))}  {c(GRAY, f'{hit:3.0f}% cached')}"
                   f"  {model_badge(s['model'])}")
 
     # ── Footer ────────────────────────────────────────────────────────────────
@@ -868,6 +916,14 @@ def _bucket_out(b):
     }
     return out
 
+def _cache_out(b):
+    st = cache_stats(b)
+    return {"hit_rate": round(st["hit_rate"], 4),
+            "write_5m_share": round(st["write_5m_share"], 4),
+            "write_1h_share": round(st["write_1h_share"], 4),
+            "uncached_cost": round(st["uncached_cost"], 6),
+            "savings": round(st["savings"], 6)}
+
 def session_out(s, show_tasks):
     out = {
         "id": s["id"],
@@ -888,6 +944,7 @@ def session_out(s, show_tasks):
         "unpriced_models": s["unpriced_models"],
         "subagents": s.get("subagents", 0),
         "subagent_cost": round(s.get("subagent_cost", 0.0), 6),
+        "cache": _cache_out(session_bucket(s)),
         "parent_id": s.get("parent_id"),
         "models": {m: _bucket_out(b) for m, b in sorted(s["models"].items())},
     }
@@ -924,6 +981,7 @@ def build_report(sessions, args, now=None, since=None):
             "budget": budget,
             "budget_exceeded": bool(budget is not None and today_cost > budget),
         },
+        "cache": _cache_out(window_bucket(sessions, now, args.days)),
         "sessions": [session_out(s, args.tasks) for s in sorted(sessions, key=lambda x: -x["cost"])],
         "projects": [dict(project=p, sessions=proj_sessions[p], **_bucket_out(b))
                      for p, b in sorted(by_proj.items(), key=lambda kv: -kv[1]["cost"])],
