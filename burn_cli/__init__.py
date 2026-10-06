@@ -475,25 +475,30 @@ def _parse_jsonl(path, proj_slug, since):
 # ── Display helpers ───────────────────────────────────────────────────────────
 UNPRICED_MARK = "+?"  # appended to a cost when some of its tokens had no pricing
 
-def fmt_cost(d, unpriced=False):
-    """Format a dollar figure. `unpriced` truthy appends a marker so a partial
-    figure is never mistaken for a complete one."""
-    if d < 0.01:
-        out = c(GRAY, "<$0.01")
-    elif d < 1.0:
-        out = c(GREEN, f"${d:.3f}")
-    elif d < 5.0:
-        out = c(YELLOW, f"${d:.2f}")
-    else:
-        out = c(ORANGE if d < 20 else RED, f"${d:.2f}")
-    if unpriced:
-        out += c(RED, UNPRICED_MARK)
-    return out
+COST_W = 9  # width of a right-aligned cost column ("$1234.56" + marker)
 
-def session_cost(s):
-    return fmt_cost(s["cost"], s.get("unpriced_tokens", 0))
+def fmt_cost(d, unpriced=False, width=COST_W):
+    """Format a dollar figure, right-aligned to `width` (0 = no padding).
+    `unpriced` truthy appends a marker so a partial figure is never mistaken
+    for a complete one."""
+    if d < 0.01:
+        color, text = GRAY, "<$0.01"
+    elif d < 1.0:
+        color, text = GREEN, f"${d:.3f}"
+    elif d < 5.0:
+        color, text = YELLOW, f"${d:.2f}"
+    else:
+        color, text = (ORANGE if d < 20 else RED), f"${d:.2f}"
+    mark = UNPRICED_MARK if unpriced else ""
+    pad = " " * max(0, width - len(text) - len(mark))
+    return pad + c(color, text) + (c(RED, mark) if mark else "")
+
+def session_cost(s, width=COST_W):
+    return fmt_cost(s["cost"], s.get("unpriced_tokens", 0), width)
 
 def fmt_tokens(n):
+    if n >= 1_000_000_000:
+        return f"{n/1_000_000_000:.2f}B"
     if n >= 1_000_000:
         return f"{n/1_000_000:.1f}M"
     if n >= 1_000:
@@ -560,20 +565,21 @@ def models_in_window(sessions, now, days):
     return dict(out)
 
 def render_model_table(by_model):
-    priced = {m: b for m, b in by_model.items() if not b["unpriced"] or b["cost"]}
+    priced = {m: b for m, b in by_model.items()
+              if (not b["unpriced"] or b["cost"]) and m not in _ZERO_COST_MODELS}
     unpriced_models = sorted(m for m, b in by_model.items() if b["unpriced"])
     total_cost = sum(b["cost"] for b in by_model.values()) or 1.0
-    print(c(GRAY, f"  {'model':26}  {'msgs':>6}  {'tokens':>7}  {'cost':>8}  share"))
+    print(c(GRAY, f"  {'model':26}  {'msgs':>6}  {'tokens':>7}  {'cost':>{COST_W}}  share"))
     for m, b in sorted(priced.items(), key=lambda kv: -kv[1]["cost"]):
         share = b["cost"] / total_cost * 100
         print(f"  {model_badge(m, width=26)}  {c(GRAY, str(b['messages']).rjust(6))}"
-              f"  {c(GRAY, fmt_tokens(bucket_tokens(b)).rjust(7))}  {fmt_cost(b['cost']).rjust(8)}"
+              f"  {c(GRAY, fmt_tokens(bucket_tokens(b)).rjust(7))}  {fmt_cost(b['cost'])}"
               f"  {c(PURPLE, bar(b['cost'], total_cost, 12))} {share:3.0f}%")
     if unpriced_models:
         toks = sum(by_model[m]["unpriced"] for m in unpriced_models)
         msgs = sum(by_model[m]["messages"] for m in unpriced_models)
         print(f"  {c(RED, 'unpriced'.ljust(26))}  {c(GRAY, str(msgs).rjust(6))}"
-              f"  {c(GRAY, fmt_tokens(toks).rjust(7))}  {c(RED, '—'.rjust(8))}"
+              f"  {c(GRAY, fmt_tokens(toks).rjust(7))}  {c(RED, '—'.rjust(COST_W))}"
               f"  {c(GRAY, ', '.join(unpriced_models))}")
 
 
@@ -608,7 +614,7 @@ def render(sessions, args):
             age = fmt_age(s["mtime"])
             proj_str = c(WHITE, s["project"][:35].ljust(36))
             branch_str = c(GRAY, branch[:20].ljust(21))
-            print(f"  {proj_str}{branch_str}  {session_cost(s)}  {c(GRAY, age)}  {model_badge(s['model'])}")
+            print(f"  {proj_str}{branch_str}  {session_cost(s)}  {c(GRAY, age.rjust(7))}  {model_badge(s['model'])}")
         hidden = len(active) - MAX_ACTIVE
         if hidden > 0:
             print(c(GRAY, f"  + {hidden} more active"))
@@ -642,7 +648,7 @@ def render(sessions, args):
         print()
         total_ctx = total_in + total_cc + total_cr
         pct_cached = (total_cr / (total_ctx + 0.001)) * 100
-        print(f"  {c(BOLD, 'TOTAL TODAY:')}  {fmt_cost(total_cost, total_unpriced)}"
+        print(f"  {c(BOLD, 'TOTAL TODAY:')}  {fmt_cost(total_cost, total_unpriced, 0)}"
               f"   {c(GRAY, fmt_tokens(total_ctx + total_out))} tokens"
               f"   {c(GREEN, fmt_tokens(total_cr))} cached ({pct_cached:.0f}%)"
               f"   {c(GRAY, fmt_tokens(total_out))} output")
@@ -713,7 +719,7 @@ def render(sessions, args):
     unpriced_all = sum(s["unpriced_tokens"] for s in sessions)
     print()
     window = "all time" if args.all_time else f"last {max(args.days, 30)}d"
-    print(c(GRAY, f"  {len(sessions)} sessions scanned ({window})  ·  total: ") + fmt_cost(total_all, unpriced_all))
+    print(c(GRAY, f"  {len(sessions)} sessions scanned ({window})  ·  total: ") + fmt_cost(total_all, unpriced_all, 0))
     if args.watch:
         print(c(GRAY, f"  Refreshing every {args.interval}s  ·  Ctrl+C to quit"))
     print()
