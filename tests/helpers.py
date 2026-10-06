@@ -4,8 +4,6 @@ Fixtures are synthetic. Never copy real session logs from ~/.claude/projects
 into this directory.
 """
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import sys
@@ -17,17 +15,11 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 
 def load_module():
-    """Import the CLI script (which has no .py suffix) as a module."""
-    name = "codeburn_under_test"
-    if name in sys.modules:
-        return sys.modules[name]
-    path = REPO_ROOT / "codeburn"
-    loader = importlib.machinery.SourceFileLoader(name, str(path))
-    spec = importlib.util.spec_from_loader(name, loader)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    loader.exec_module(module)
-    return module
+    """Import the package from the checkout (tests run with the repo root on sys.path)."""
+    if str(REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(REPO_ROOT))
+    import burn_cli
+    return burn_cli
 
 
 def iso(dt):

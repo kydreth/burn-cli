@@ -17,7 +17,7 @@ def load_update_pricing():
 
 class PricingFile(unittest.TestCase):
     def setUp(self):
-        self.pricing = json.loads((REPO_ROOT / "pricing.json").read_text())
+        self.pricing = json.loads((REPO_ROOT / "burn_cli" / "pricing.json").read_text())
 
     def test_claude_5_family_present_with_1h_rates(self):
         for model in ("claude-opus-5-5", "claude-opus-5", "claude-fable-5-1",

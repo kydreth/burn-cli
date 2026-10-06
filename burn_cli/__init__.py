@@ -1,5 +1,10 @@
-#!/usr/bin/env python3
-"""codeburn — Monitor Claude Code agent token usage and costs."""
+"""burn — terminal dashboard for Claude Code token usage and cost.
+
+Reads the session logs Claude Code writes under ~/.claude/projects and
+renders cost per project, session, model and day. No network, no API keys.
+"""
+
+__version__ = "0.1.0"
 
 import json
 import os
@@ -457,7 +462,7 @@ def render(sessions, args):
     # ── Title bar ─────────────────────────────────────────────────────────────
     if not NO_COLOR:
         print("\033[H\033[2J", end="")  # clear screen
-    title = f"  🔥 CODEBURN — Claude Agent Usage Monitor   {today_str}"
+    title = f"  🔥 BURN — Claude Code usage monitor   {today_str}"
     print(c(BOLD + WHITE, title))
     print(c(GRAY, "  " + "═" * 64))
 
@@ -592,9 +597,11 @@ def render(sessions, args):
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(
-        description="codeburn — Claude Code agent usage monitor",
+        description="burn — Claude Code token usage and cost dashboard",
+        prog="burn",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    ap.add_argument("--version",  action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--days",     type=int, default=7,   help="Days of history (default: 7)")
     ap.add_argument("--sessions", action="store_true",   help="Show per-session breakdown")
     ap.add_argument("--limit",    type=int, default=30,  help="Max sessions shown with --sessions (default: 30)")

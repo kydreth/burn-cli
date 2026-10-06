@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "burn-cli"
+version = "0.1.0"
+description = "Terminal dashboard for Claude Code token usage and cost, read from local session logs"
+readme = "README.md"
+license = { file = "LICENSE" }
+# f-strings (3.6) and datetime.fromisoformat (3.7) are the real floor; 3.8 is
+# the oldest version the test-suite is expected to run on.
+requires-python = ">=3.8"
+keywords = ["claude", "claude-code", "tokens", "cost", "cli", "dashboard"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Source = "https://github.com/your-org/burn-cli"
+
+[project.scripts]
+burn = "burn_cli:main"
+
+[tool.setuptools]
+packages = ["burn_cli"]
+
+[tool.setuptools.package-data]
+burn_cli = ["pricing.json"]

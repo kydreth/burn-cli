@@ -19,7 +19,7 @@ LITELLM_URL_TEMPLATE = (
     "https://raw.githubusercontent.com/BerriAI/litellm/{ref}"
     "/model_prices_and_context_window.json"
 )
-PRICING_FILE = Path(__file__).resolve().parent / "pricing.json"
+PRICING_FILE = Path(__file__).resolve().parent / "burn_cli" / "pricing.json"
 
 FIELDS = ("input", "output", "cache_write", "cache_write_1h", "cache_read")
 
