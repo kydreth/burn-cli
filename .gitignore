@@ -1,13 +1,59 @@
-# Python
+# --- Session logs ------------------------------------------------------------
+# Claude Code session logs hold private prompts and code. Never commit one;
+# hand-built test fixtures under tests/fixtures/ are re-included below.
+*.jsonl
+!tests/fixtures/*.jsonl
+scratch/
+scratchpad/
+
+# --- Secrets and credentials -------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.netrc
+.pypirc
+
+# --- Python -----------------------------------------------------------------
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 build/
 dist/
 *.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.python-version
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
 
-# AI assistants
+# --- AI assistants -----------------------------------------------------------
 .claude/
+CLAUDE.local.md
+.cursor/
+.aider*
 
-# Never commit real session logs
-*.jsonl
-!tests/fixtures/*.jsonl
+# --- OS and editors ----------------------------------------------------------
+.DS_Store
+._*
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Logs and temp files -----------------------------------------------------
+*.log
+*.tmp
+*.bak
+tmp/
