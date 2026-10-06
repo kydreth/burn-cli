@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
-"""Fetch Claude model pricing from LiteLLM and write pricing.json."""
+"""Fetch Claude model pricing from LiteLLM's price table and write pricing.json.
 
+The upstream file is fetched from a pinned commit so a later change to the
+LiteLLM repository cannot silently alter rates. Bump LITELLM_COMMIT (and the
+date comment) deliberately, review the printed diff, then confirm.
+"""
+
+import argparse
 import json
 import sys
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-LITELLM_URL = (
-    "https://raw.githubusercontent.com/BerriAI/litellm/main"
+# Pinned 2026-10-06. Update deliberately; the diff printed below is the review step.
+LITELLM_COMMIT = "191967c20781877d606885f03f50721ab825ba0a"
+LITELLM_URL_TEMPLATE = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/{ref}"
     "/model_prices_and_context_window.json"
 )
 PRICING_FILE = Path(__file__).resolve().parent / "pricing.json"
+
+FIELDS = ("input", "output", "cache_write", "cache_write_1h", "cache_read")
 
 
 def fetch(url, timeout=15):
@@ -27,78 +37,96 @@ def to_per_million(v):
     return round(v * 1_000_000, 6) if v is not None else None
 
 
-def main():
-    print(f"fetching {LITELLM_URL} ...")
-    data = fetch(LITELLM_URL)
-
-    fresh = {}
-    skipped = []
-
+def extract(data):
+    """Reduce LiteLLM's table to {model: {input, output, cache_write, cache_write_1h, cache_read}}."""
+    fresh, skipped = {}, []
     for key, entry in data.items():
-        if not key.startswith("claude"):
+        if not key.startswith("claude") or not isinstance(entry, dict):
             continue
-        if not isinstance(entry, dict):
-            continue
-        # Skip entries with junk suffixes that would never match a real model string
+        # Skip provider-specific aliases that never appear in Claude Code logs
         if key.endswith("-v1:0") or "@" in key:
             continue
-
         inp = entry.get("input_cost_per_token")
         out = entry.get("output_cost_per_token")
         if inp is None or out is None:
             skipped.append(key)
             continue
-
         fresh[key] = {
-            "input":       to_per_million(inp),
-            "output":      to_per_million(out),
-            "cache_write": to_per_million(entry.get("cache_creation_input_token_cost")),
-            "cache_read":  to_per_million(entry.get("cache_read_input_token_cost")),
+            "input":          to_per_million(inp),
+            "output":         to_per_million(out),
+            "cache_write":    to_per_million(entry.get("cache_creation_input_token_cost")),
+            "cache_write_1h": to_per_million(entry.get("cache_creation_input_token_cost_above_1hr")),
+            "cache_read":     to_per_million(entry.get("cache_read_input_token_cost")),
         }
+    return fresh, skipped
 
-    # Load existing file
+
+def print_diff(old_models, fresh):
+    added   = sorted(set(fresh) - set(old_models))
+    removed = sorted(set(old_models) - set(fresh))
+    changed = sorted(k for k in set(fresh) & set(old_models) if fresh[k] != old_models[k])
+    if not (added or removed or changed):
+        return False
+    print("changes:")
+    for k in added:
+        p = fresh[k]
+        print(f"  + {k}  " + "  ".join(f"{f}={p.get(f)}" for f in FIELDS))
+    for k in removed:
+        print(f"  - {k}  (kept: manually added entries are never removed)")
+    for k in changed:
+        old, new = old_models[k], fresh[k]
+        fields = [f"{f}: {old.get(f)} → {new.get(f)}" for f in FIELDS if old.get(f) != new.get(f)]
+        print(f"  ~ {k}  {', '.join(fields)}")
+    return True
+
+
+def confirm(assume_yes):
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        print("error: refusing to write without review — rerun with --yes to accept the diff above.",
+              file=sys.stderr)
+        return False
+    answer = input("Apply these changes to pricing.json? [y/N] ").strip().lower()
+    return answer in ("y", "yes")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--yes", "-y", action="store_true",
+                    help="Write without asking (the diff is still printed)")
+    ap.add_argument("--ref", default=LITELLM_COMMIT,
+                    help="LiteLLM git ref to fetch (default: pinned commit)")
+    args = ap.parse_args()
+
+    url = LITELLM_URL_TEMPLATE.format(ref=args.ref)
+    print(f"fetching {url} ...")
+    fresh, skipped = extract(fetch(url))
+
     existing = {}
     if PRICING_FILE.exists():
         try:
             existing = json.loads(PRICING_FILE.read_text())
         except json.JSONDecodeError:
             pass
-
-    # Separate metadata keys from model entries
     old_models = {k: v for k, v in existing.items() if not k.startswith("_")}
 
-    # Show diff before writing
-    added   = sorted(set(fresh) - set(old_models))
-    removed = sorted(set(old_models) - set(fresh))
-    changed = sorted(k for k in set(fresh) & set(old_models) if fresh[k] != old_models[k])
-
-    if added or removed or changed:
-        print("changes:")
-        for k in added:
-            p = fresh[k]
-            print(f"  + {k}  input={p['input']}  output={p['output']}")
-        for k in removed:
-            print(f"  - {k}")
-        for k in changed:
-            old, new = old_models[k], fresh[k]
-            fields = [
-                f"{f}: {old.get(f)} → {new.get(f)}"
-                for f in ("input", "output", "cache_write", "cache_read")
-                if old.get(f) != new.get(f)
-            ]
-            print(f"  ~ {k}  {', '.join(fields)}")
-    else:
+    if not print_diff(old_models, fresh):
         print("no changes")
+        return
 
-    # Merge: start with all existing entries (preserves manually added models),
-    # then let fresh data win on key conflicts.
+    if not confirm(args.yes):
+        print("aborted; pricing.json unchanged")
+        sys.exit(2)
+
+    # Merge: keep every existing entry (manually added models survive),
+    # fresh data wins on key conflicts.
     merged = dict(existing)
     merged.update(fresh)
     merged["_updated"] = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    merged["_source"] = LITELLM_URL
+    merged["_source"] = url
 
     PRICING_FILE.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n")
-
     print(f"wrote {len(fresh)} models to {PRICING_FILE}")
     if skipped:
         print(f"skipped {len(skipped)} entries missing input/output cost")
