@@ -95,6 +95,10 @@ def display_task(s):
     t = s.get("first_task")
     return redact(t) if (REDACT and t) else t
 
+def display_task_id(s):
+    t = s.get("task_id")
+    return redact(t) if (REDACT and t) else t
+
 # ── ANSI colours ──────────────────────────────────────────────────────────────
 RESET  = "\033[0m"
 BOLD   = "\033[1m"
@@ -230,9 +234,32 @@ def load_config(path=None):
         except (re.error, KeyError, TypeError) as e:
             print(f"warning: ignoring bad project_map rule {rule!r}: {e}", file=sys.stderr)
     cfg["_project_rules"] = rules
+    cfg["_task_re"] = None
+    if cfg.get("task_id_pattern"):
+        try:
+            cfg["_task_re"] = re.compile(cfg["task_id_pattern"])
+        except re.error as e:
+            print(f"warning: ignoring bad task_id_pattern: {e}", file=sys.stderr)
     return cfg
 
 CONFIG = {}
+
+# Task id in a branch name: <type>/<word>-<segment with a digit>[-slug]
+# e.g. feat/ABC-123-login → ABC-123, fix/gitops-szr45-retry → gitops-szr45.
+# Override with "task_id_pattern" in the config (first capture group = id).
+DEFAULT_TASK_ID_RE = re.compile(
+    r"^(?:feat|feature|fix|bug|docs|chore|refactor|perf|test)/"
+    r"([A-Za-z]+-[A-Za-z0-9]*\d[A-Za-z0-9]*)(?:[-/]|$)"
+)
+
+def task_id_from_branch(branch):
+    if not branch:
+        return None
+    pattern = CONFIG.get("_task_re") or DEFAULT_TASK_ID_RE
+    m = pattern.search(branch)
+    if not m:
+        return None
+    return m.group(1) if m.groups() else m.group(0)
 
 # Sibling-directory worktree convention: <repo>-<task-id>-wt or <repo>-wt
 _WT_SUFFIX_RE = re.compile(r"^(.+?)(?:-[A-Za-z0-9]+)?-wt$")
@@ -507,6 +534,7 @@ def _parse_jsonl(path, proj_slug, since):
         "project":              proj,
         "project_slug":         proj_slug,
         "git_branch":           git_branch,
+        "task_id":              task_id_from_branch(git_branch),
         "first_task":           first_task,
         "cwd":                  cwd,
         "start_ts":             start_ts,
@@ -692,6 +720,32 @@ def render_cache_section(sessions, now, days):
     print(f"  actual {fmt_cost(st['cost'], b['unpriced'], 0)}   without caching ≈ "
           f"{fmt_cost(st['uncached_cost'], b['unpriced'], 0)}   saved {c(GREEN, saved)} ({pct:.0f}%)")
 
+NO_TASK = "(no task id)"
+
+def tasks_in_window(sessions, now, days):
+    """{task_id: (bucket, session_count)} over turns in the last `days` UTC days."""
+    cutoff = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+    out, counts = defaultdict(new_bucket), defaultdict(int)
+    for s in sessions:
+        tid = display_task_id(s) or NO_TASK
+        seen = False
+        for (day, _model), b in s["day_models"].items():
+            if day >= cutoff:
+                bucket_merge(out[tid], b)
+                seen = True
+        if seen:
+            counts[tid] += 1
+    return {t: (b, counts[t]) for t, b in out.items()}
+
+def render_task_table(by_task):
+    rows = sorted(by_task.items(), key=lambda kv: (kv[0] == NO_TASK, -kv[1][0]["cost"]))
+    max_cost = max((b["cost"] for b, _ in by_task.values()), default=1) or 1
+    print(c(GRAY, f"  {'task':24}  {'sess':>4}  {'msgs':>6}  {'cost':>{COST_W}}"))
+    for tid, (b, n) in rows:
+        label = c(GRAY if tid == NO_TASK else WHITE, tid[:24].ljust(24))
+        print(f"  {label}  {c(GRAY, str(n).rjust(4))}  {c(GRAY, str(b['messages']).rjust(6))}"
+              f"  {fmt_cost(b['cost'], b['unpriced'])}  {c(CYAN, bar(b['cost'], max_cost, 14))}")
+
 def models_in_window(sessions, now, days):
     """Aggregate per-model buckets over turns in the last `days` UTC days."""
     cutoff = (now - timedelta(days=days - 1)).strftime("%Y-%m-%d")
@@ -809,6 +863,13 @@ def render(sessions, args):
 
     # ── Cache efficiency ──────────────────────────────────────────────────────
     render_cache_section(sessions, now, args.days)
+
+    # ── By task id ────────────────────────────────────────────────────────────
+    if getattr(args, "by_task", False):
+        by_task = tasks_in_window(sessions, now, args.days)
+        if by_task:
+            header(f"BY TASK — LAST {args.days} DAYS")
+            render_task_table(by_task)
 
     # ── Top runs — last 7 days ─────────────────────────────────────────────────
     week_sessions = [s for s in sessions if s["last_ts"] >= seven_days_ago]
@@ -929,6 +990,7 @@ def session_out(s, show_tasks):
         "id": s["id"],
         "project": s["project"],
         "branch": display_branch(s),
+        "task_id": display_task_id(s),
         "model": s["model"],
         "start": _iso(s["start_ts"]),
         "last": _iso(s["last_ts"]),
@@ -988,6 +1050,9 @@ def build_report(sessions, args, now=None, since=None):
         "days": [dict(date=d, **_bucket_out(b)) for d, b in sorted(by_day.items())],
         "models": [dict(model=m, **_bucket_out(b))
                    for m, b in sorted(by_model.items(), key=lambda kv: -kv[1]["cost"])],
+        "tasks": [dict(task_id=(None if t == NO_TASK else t), sessions=n, **_bucket_out(b))
+                  for t, (b, n) in sorted(tasks_in_window(sessions, now, args.days).items(),
+                                          key=lambda kv: -kv[1][0]["cost"])],
     }
 
 def render_json(sessions, args, since=None):
@@ -1015,6 +1080,8 @@ def main():
     ap.add_argument("--since",    type=str, default=None, metavar="YYYY-MM-DD",
                     help="Only sessions active on/after this UTC date (overrides the 30-day window)")
     ap.add_argument("--json",     action="store_true",   help="Print a JSON report instead of the dashboard")
+    ap.add_argument("--by-task",  action="store_true",
+                    help="Group cost by task id parsed from branch names (feat|fix|…/<id>-slug)")
     ap.add_argument("--split-subagents", action="store_true",
                     help="List subagent transcripts as their own rows instead of rolling them into the parent session")
     ap.add_argument("--tasks",    action="store_true",

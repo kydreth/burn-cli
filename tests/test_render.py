@@ -34,7 +34,7 @@ def make_projects(tmp, now):
 def default_args(**over):
     base = dict(days=7, sessions=False, limit=30, watch=False, interval=15,
                 project=None, all_time=False, config=None, tasks=False, redact=False,
-                budget=None, since=None, json=False, split_subagents=False)
+                budget=None, since=None, json=False, split_subagents=False, by_task=False)
     base.update(over)
     return argparse.Namespace(**base)
 
