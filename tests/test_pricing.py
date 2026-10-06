@@ -79,3 +79,42 @@ class UnpricedModels(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OneHourCacheWrites(unittest.TestCase):
+    def setUp(self):
+        cb._warned_models.clear()
+        cb.PRICING["claude-test-model"] = {"input": 1.0, "output": 10.0,
+                                           "cache_write": 1.25, "cache_read": 0.1}
+
+    def tearDown(self):
+        cb.PRICING.pop("claude-test-model", None)
+
+    def test_split_prefers_breakdown(self):
+        u = {"cache_creation_input_tokens": 1000,
+             "cache_creation": {"ephemeral_5m_input_tokens": 400, "ephemeral_1h_input_tokens": 600}}
+        self.assertEqual(cb.cache_write_split(u), (400, 600))
+
+    def test_split_without_breakdown_is_all_5m(self):
+        self.assertEqual(cb.cache_write_split({"cache_creation_input_tokens": 1000}), (1000, 0))
+
+    def test_1h_writes_cost_double_by_default(self):
+        u5 = {"cache_creation_input_tokens": 1_000_000,
+              "cache_creation": {"ephemeral_5m_input_tokens": 1_000_000, "ephemeral_1h_input_tokens": 0}}
+        u1 = {"cache_creation_input_tokens": 1_000_000,
+              "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 1_000_000}}
+        self.assertAlmostEqual(cb.calc_cost("claude-test-model", u5), 1.25)
+        self.assertAlmostEqual(cb.calc_cost("claude-test-model", u1), 2.50)
+
+    def test_explicit_cache_write_1h_rate_wins(self):
+        cb.PRICING["claude-test-model"]["cache_write_1h"] = 3.0
+        u1 = {"cache_creation_input_tokens": 1_000_000,
+              "cache_creation": {"ephemeral_1h_input_tokens": 1_000_000}}
+        self.assertAlmostEqual(cb.calc_cost("claude-test-model", u1), 3.0)
+
+    def test_session_tracks_1h_tokens(self):
+        usage = dict(USAGE)
+        usage["cache_creation"] = {"ephemeral_5m_input_tokens": 250, "ephemeral_1h_input_tokens": 750}
+        s = parse(assistant_lines(TS, "claude-test-model", usage, "m1", "r1", blocks=2))
+        self.assertEqual(s["cache_creation_tokens"], 1000)
+        self.assertEqual(s["cache_creation_1h_tokens"], 750)
