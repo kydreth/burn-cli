@@ -23,6 +23,9 @@ _PRICING_FILE = Path(__file__).resolve().parent / "pricing.json"
 # Pseudo-model Claude Code logs for locally generated turns (no API call).
 _ZERO_COST_MODELS = {"<synthetic>"}
 
+# Per-turn (timestamp, cost) pairs are kept this far back for burn-rate maths.
+RECENT_TURNS_SECONDS = 25 * 3600
+
 def _load_pricing():
     if not _PRICING_FILE.exists():
         print(
@@ -159,6 +162,46 @@ def usage_total(usage):
             + usage.get("cache_creation_input_tokens", 0)
             + usage.get("cache_read_input_tokens", 0))
 
+def calc_uncached_cost(model, usage):
+    """What the message would have cost with no prompt cache: every context
+    token billed as fresh input. None if the model is unpriced."""
+    if model in _ZERO_COST_MODELS:
+        return 0.0
+    p = _lookup_pricing(model)
+    if p is None:
+        return None
+    ctx = (usage.get("input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+           + usage.get("cache_read_input_tokens", 0))
+    return ctx / 1_000_000 * p["input"] + usage.get("output_tokens", 0) / 1_000_000 * p["output"]
+
+BUCKET_KEYS = ("input", "output", "cache_create", "cache_create_1h", "cache_read",
+               "cost", "uncached_cost", "unpriced", "messages")
+
+def new_bucket():
+    return {k: 0 for k in BUCKET_KEYS}
+
+def bucket_add_usage(b, usage, msg_cost, uncached_cost):
+    """Accumulate one (deduplicated) message into a bucket."""
+    b["input"]        += usage.get("input_tokens", 0)
+    b["output"]       += usage.get("output_tokens", 0)
+    b["cache_create"] += usage.get("cache_creation_input_tokens", 0)
+    b["cache_create_1h"] += cache_write_split(usage)[1]
+    b["cache_read"]   += usage.get("cache_read_input_tokens", 0)
+    b["messages"]     += 1
+    if msg_cost is None:
+        b["unpriced"] += usage_total(usage)
+    else:
+        b["cost"] += msg_cost
+        b["uncached_cost"] += uncached_cost or 0.0
+
+def bucket_merge(dst, src):
+    for k in BUCKET_KEYS:
+        dst[k] += src[k]
+    return dst
+
+def bucket_tokens(b):
+    return b["input"] + b["output"] + b["cache_create"] + b["cache_read"]
+
 # ── Config ────────────────────────────────────────────────────────────────────
 def default_config_path():
     base = os.getenv("XDG_CONFIG_HOME") or str(Path.home() / ".config")
@@ -277,12 +320,14 @@ def _parse_jsonl(path, proj_slug, since):
     if since and mtime < since:
         return None
 
-    input_tok = output_tok = cache_create_tok = cache_read_tok = 0
-    cache_create_1h_tok = 0
-    cost = 0.0
-    unpriced_tok = 0
+    total = new_bucket()
+    days = defaultdict(new_bucket)    # "YYYY-MM-DD" -> bucket (day of each turn)
+    models = defaultdict(new_bucket)  # model -> bucket
+    turns = []                        # (epoch, cost) for recent turns, for burn rate
+    turns_cutoff = time.time() - RECENT_TURNS_SECONDS
     unpriced_models = set()
     start_ts = last_ts = None
+    sidechain = False
     git_branch = cwd = first_task = None
     model_turns = defaultdict(int)  # model -> turn count, to find dominant model
     msg_count = 0
@@ -322,6 +367,8 @@ def _parse_jsonl(path, proj_slug, since):
                         last_ts = ts
                     except ValueError:
                         pass
+                if obj.get("isSidechain"):
+                    sidechain = True
 
                 if obj.get("gitBranch"):
                     git_branch = _sanitize(obj["gitBranch"])
@@ -365,17 +412,17 @@ def _parse_jsonl(path, proj_slug, since):
                         if key in seen_messages:
                             continue
                         seen_messages.add(key)
-                        input_tok       += usage.get("input_tokens", 0)
-                        output_tok      += usage.get("output_tokens", 0)
-                        cache_create_tok += usage.get("cache_creation_input_tokens", 0)
-                        cache_create_1h_tok += cache_write_split(usage)[1]
-                        cache_read_tok  += usage.get("cache_read_input_tokens", 0)
                         msg_cost = calc_cost(turn_model, usage)
+                        uncached = calc_uncached_cost(turn_model, usage) if msg_cost is not None else None
                         if msg_cost is None:
-                            unpriced_tok += usage_total(usage)
                             unpriced_models.add(turn_model)
-                        else:
-                            cost += msg_cost
+                        bucket_add_usage(total, usage, msg_cost, uncached)
+                        bucket_add_usage(models[turn_model], usage, msg_cost, uncached)
+                        day_ts = last_ts or mtime
+                        bucket_add_usage(days[day_ts.strftime("%Y-%m-%d")], usage, msg_cost, uncached)
+                        epoch = day_ts.timestamp()
+                        if epoch >= turns_cutoff:
+                            turns.append((epoch, msg_cost or 0.0))
                         if turn_model not in _ZERO_COST_MODELS:
                             model_turns[turn_model] += 1
                         msg_count += 1
@@ -404,15 +451,20 @@ def _parse_jsonl(path, proj_slug, since):
         "last_ts":              last_ts or mtime,
         "mtime":                mtime,
         "model":                dominant_model,
+        "sidechain":            sidechain,
         "messages":             msg_count,
-        "input_tokens":         input_tok,
-        "output_tokens":        output_tok,
-        "cache_creation_tokens": cache_create_tok,
-        "cache_creation_1h_tokens": cache_create_1h_tok,
-        "cache_read_tokens":    cache_read_tok,
-        "cost":                 cost,
-        "unpriced_tokens":      unpriced_tok,
+        "input_tokens":         total["input"],
+        "output_tokens":        total["output"],
+        "cache_creation_tokens": total["cache_create"],
+        "cache_creation_1h_tokens": total["cache_create_1h"],
+        "cache_read_tokens":    total["cache_read"],
+        "cost":                 total["cost"],
+        "uncached_cost":        total["uncached_cost"],
+        "unpriced_tokens":      total["unpriced"],
         "unpriced_models":      sorted(unpriced_models),
+        "days":                 dict(days),
+        "models":               dict(models),
+        "turns":                turns,
     }
 
 # ── Display helpers ───────────────────────────────────────────────────────────
@@ -518,20 +570,11 @@ def render(sessions, args):
             print(c(GRAY, f"  + {hidden} more active"))
 
     # ── Today ─────────────────────────────────────────────────────────────────
-    today_sessions = [s for s in sessions if s["last_ts"].strftime("%Y-%m-%d") == today_str]
+    today_sessions = [s for s in sessions if today_str in s["days"]]
     if today_sessions:
-        by_proj = defaultdict(lambda: {"cost": 0, "input": 0, "output": 0,
-                                       "cache_create": 0, "cache_read": 0, "msgs": 0,
-                                       "unpriced": 0})
+        by_proj = defaultdict(new_bucket)
         for s in today_sessions:
-            p = by_proj[s["project"]]
-            p["cost"]         += s["cost"]
-            p["unpriced"]     += s["unpriced_tokens"]
-            p["input"]        += s["input_tokens"]
-            p["output"]       += s["output_tokens"]
-            p["cache_create"] += s["cache_creation_tokens"]
-            p["cache_read"]   += s["cache_read_tokens"]
-            p["msgs"]         += s["messages"]
+            bucket_merge(by_proj[s["project"]], s["days"][today_str])
 
         sorted_projs = sorted(by_proj.items(), key=lambda x: -x[1]["cost"])
         max_cost = max((v["cost"] for v in by_proj.values()), default=1)
@@ -583,13 +626,10 @@ def render(sessions, args):
     # ── Daily breakdown (last N days) ─────────────────────────────────────────
     days = args.days
     header(f"LAST {days} DAYS")
-    by_day = defaultdict(lambda: {"cost": 0, "input": 0, "output": 0, "unpriced": 0})
+    by_day = defaultdict(new_bucket)
     for s in sessions:
-        day = s["last_ts"].strftime("%Y-%m-%d")
-        by_day[day]["cost"]   += s["cost"]
-        by_day[day]["unpriced"] += s["unpriced_tokens"]
-        by_day[day]["input"]  += s["input_tokens"]
-        by_day[day]["output"] += s["output_tokens"]
+        for day, b in s["days"].items():
+            bucket_merge(by_day[day], b)
 
     recent_days = sorted(by_day.keys(), reverse=True)[:days]
     max_day_cost = max((by_day[d]["cost"] for d in recent_days), default=1)

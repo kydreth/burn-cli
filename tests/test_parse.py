@@ -93,5 +93,43 @@ class DedupeFallbacks(unittest.TestCase):
         self.assertEqual(s["messages"], 3)
 
 
+
+class PerDayPerModel(unittest.TestCase):
+    def test_turns_are_attributed_to_their_own_day_and_model(self):
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+        from tests.helpers import assistant_lines, write_jsonl
+        d1 = datetime(2026, 1, 10, 23, 50, tzinfo=timezone.utc)
+        d2 = d1 + timedelta(minutes=20)  # crosses midnight into 2026-01-11
+        u = {"input_tokens": 10, "output_tokens": 10}
+        lines = assistant_lines(d1, "claude-sonnet-4-6", u, "m1", "r1", blocks=2)
+        lines += assistant_lines(d2, "claude-opus-4-7", u, "m2", "r2")
+        lines += assistant_lines(d2 + timedelta(minutes=1), "claude-opus-4-7", u, "m3", "r3")
+        with tempfile.TemporaryDirectory() as tmp:
+            s = cb._parse_jsonl(write_jsonl(Path(tmp) / "s.jsonl", lines), "-x", None)
+        self.assertEqual(sorted(s["days"]), ["2026-01-10", "2026-01-11"])
+        self.assertEqual(s["days"]["2026-01-10"]["messages"], 1)
+        self.assertEqual(s["days"]["2026-01-11"]["messages"], 2)
+        self.assertEqual(s["models"]["claude-opus-4-7"]["messages"], 2)
+        self.assertEqual(s["models"]["claude-sonnet-4-6"]["output"], 10)
+        self.assertAlmostEqual(sum(b["cost"] for b in s["days"].values()), s["cost"])
+        self.assertAlmostEqual(sum(b["cost"] for b in s["models"].values()), s["cost"])
+        self.assertEqual(s["model"], "claude-opus-4-7")
+
+    def test_uncached_cost_treats_all_context_as_fresh_input(self):
+        import tempfile
+        from datetime import datetime, timezone
+        from tests.helpers import assistant_lines, write_jsonl
+        ts = datetime(2026, 1, 10, tzinfo=timezone.utc)
+        u = {"input_tokens": 0, "output_tokens": 0,
+             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 1_000_000}
+        with tempfile.TemporaryDirectory() as tmp:
+            s = cb._parse_jsonl(write_jsonl(Path(tmp) / "s.jsonl",
+                                            assistant_lines(ts, "claude-sonnet-4-6", u, "m", "r")), "-x", None)
+        p = cb.PRICING["claude-sonnet-4-6"]
+        self.assertAlmostEqual(s["cost"], p["cache_read"])
+        self.assertAlmostEqual(s["uncached_cost"], p["input"])
+
+
 if __name__ == "__main__":
     unittest.main()
