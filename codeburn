@@ -136,8 +136,60 @@ def usage_total(usage):
             + usage.get("cache_creation_input_tokens", 0)
             + usage.get("cache_read_input_tokens", 0))
 
+# ── Config ────────────────────────────────────────────────────────────────────
+def default_config_path():
+    base = os.getenv("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "burn" / "config.json"
+
+def load_config(path=None):
+    """Optional user config. Currently:
+
+      {"project_map": [{"pattern": "<regex>", "replace": "<repl>"}, ...]}
+
+    Each rule is applied to the derived project name with re.sub; the first
+    rule that changes the name wins. Missing file → empty config.
+    """
+    path = Path(path) if path else default_config_path()
+    if not path.exists():
+        return {}
+    try:
+        cfg = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"warning: could not read config {path}: {e}", file=sys.stderr)
+        return {}
+    rules = []
+    for rule in cfg.get("project_map", []) or []:
+        try:
+            rules.append((re.compile(rule["pattern"]), rule.get("replace", "")))
+        except (re.error, KeyError, TypeError) as e:
+            print(f"warning: ignoring bad project_map rule {rule!r}: {e}", file=sys.stderr)
+    cfg["_project_rules"] = rules
+    return cfg
+
+CONFIG = {}
+
+# Sibling-directory worktree convention: <repo>-<task-id>-wt or <repo>-wt
+_WT_SUFFIX_RE = re.compile(r"^(.+?)(?:-[A-Za-z0-9]+)?-wt$")
+
+def _strip_worktree_suffix(name):
+    m = _WT_SUFFIX_RE.match(name)
+    return m.group(1) if m else name
+
+def _apply_project_map(name):
+    for pattern, repl in CONFIG.get("_project_rules", ()):
+        new = pattern.sub(repl, name)
+        if new != name:
+            return new
+    return name
+
 def project_name(cwd, slug):
     """Derive a readable project name from cwd path or slug."""
+    name = _raw_project_name(cwd, slug)
+    head, sep, tail = name.rpartition("/")
+    name = head + sep + _strip_worktree_suffix(tail)
+    return _apply_project_map(name)
+
+def _raw_project_name(cwd, slug):
     if cwd:
         parts = cwd.rstrip("/").split("/")
         # Worktree: strip 'worktrees/NAME' suffix (and Claude Code's '.claude' parent)
@@ -151,7 +203,7 @@ def project_name(cwd, slug):
                 return "/".join(proj_parts[-2:])
             elif proj_parts:
                 return proj_parts[-1]
-        # Normal: last 2 path components (e.g. git/eternal-sigil-workspace)
+        # Normal: last 2 path components (e.g. git/my-workspace)
         if len(parts) >= 2:
             return "/".join(parts[-2:])
         return parts[-1] if parts else slug
@@ -550,7 +602,12 @@ def main():
     ap.add_argument("--interval", type=int, default=15,  help="Refresh interval in seconds (default: 15)")
     ap.add_argument("--project",  type=str, default=None, help="Filter to project substring")
     ap.add_argument("--all-time", action="store_true",   help="Include all sessions (not just last 30 days)")
+    ap.add_argument("--config",   type=str, default=None,
+                    help=f"Config file (default: {default_config_path()})")
     args = ap.parse_args()
+
+    global CONFIG
+    CONFIG = load_config(args.config)
 
     projects_dir = Path.home() / ".claude" / "projects"
     if not projects_dir.exists():
