@@ -284,32 +284,90 @@ def _raw_project_name(cwd, slug):
             continue
     return "-".join(parts[-3:]) if len(parts) >= 3 else slug
 
-def parse_sessions(projects_dir, since=None, cache=None):
+def parse_sessions(projects_dir, since=None, cache=None, split_subagents=False):
     """
-    Returns list of session dicts:
-      { id, project, project_slug, git_branch, cwd,
-        start_ts, last_ts, mtime, model, messages,
-        input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, cost }
+    Returns list of session dicts (see _parse_jsonl for the keys).
+
+    Subagent transcripts live at <project>/<session-id>/subagents/agent-*.jsonl.
+    By default their usage is rolled into the parent session; with
+    split_subagents=True they are returned as their own entries (id
+    "<parent>/<agent>", parent_id set, project inherited from the parent).
 
     cache: optional dict mapping (path_str, mtime_float) -> session dict.
     Pass the same dict across calls in watch mode to avoid re-parsing unchanged files.
     """
+    def load(path, slug):
+        if cache is None:
+            return _parse_jsonl(path, slug, since)
+        key = (str(path), path.stat().st_mtime)
+        if key not in cache:
+            cache[key] = _parse_jsonl(path, slug, since)
+        return cache[key]
+
     sessions = []
     for proj_dir in sorted(projects_dir.iterdir()):
         if not proj_dir.is_dir():
             continue
+        by_id = {}
         for jsonl_path in sorted(proj_dir.glob("*.jsonl")):
-            if cache is not None:
-                mtime_f = jsonl_path.stat().st_mtime
-                key = (str(jsonl_path), mtime_f)
-                if key not in cache:
-                    cache[key] = _parse_jsonl(jsonl_path, proj_dir.name, since)
-                session = cache[key]
-            else:
-                session = _parse_jsonl(jsonl_path, proj_dir.name, since)
+            session = load(jsonl_path, proj_dir.name)
             if session:
+                # copy so subagent merges never mutate the cached object
+                session = dict(session, subagents=0, subagent_cost=0.0)
+                by_id[session["id"]] = session
                 sessions.append(session)
+        for agent_path in sorted(proj_dir.glob("*/subagents/*.jsonl")):
+            child = load(agent_path, proj_dir.name)
+            if not child:
+                continue
+            parent_id = agent_path.parent.parent.name
+            parent = by_id.get(parent_id)
+            if split_subagents or parent is None:
+                child = dict(child, id=f"{parent_id}/{agent_path.stem}", parent_id=parent_id,
+                             sidechain=True, subagents=0, subagent_cost=0.0)
+                if parent is not None:
+                    child["project"] = parent["project"]
+                sessions.append(child)
+            else:
+                merge_subagent(parent, child)
     return sessions
+
+def _recompute_totals(s):
+    """Refresh session totals, days and models from s["day_models"]."""
+    total, days, models = new_bucket(), defaultdict(new_bucket), defaultdict(new_bucket)
+    for (day, model), b in s["day_models"].items():
+        bucket_merge(total, b)
+        bucket_merge(days[day], b)
+        bucket_merge(models[model], b)
+    s.update({
+        "days": dict(days), "models": dict(models),
+        "messages": total["messages"],
+        "input_tokens": total["input"], "output_tokens": total["output"],
+        "cache_creation_tokens": total["cache_create"],
+        "cache_creation_1h_tokens": total["cache_create_1h"],
+        "cache_read_tokens": total["cache_read"],
+        "cost": total["cost"], "uncached_cost": total["uncached_cost"],
+        "unpriced_tokens": total["unpriced"],
+        "unpriced_models": sorted(m for m, b in models.items() if b["unpriced"]),
+    })
+    return s
+
+def merge_subagent(parent, child):
+    """Fold a subagent transcript into its parent session (in place)."""
+    merged = {k: dict(b) for k, b in parent["day_models"].items()}
+    for k, b in child["day_models"].items():
+        bucket_merge(merged.setdefault(k, new_bucket()), b)
+    parent["day_models"] = merged
+    parent["turns"] = parent["turns"] + child["turns"]
+    parent["subagents"] += 1
+    parent["subagent_cost"] += child["cost"]
+    if child["mtime"] > parent["mtime"]:
+        parent["mtime"] = child["mtime"]
+    if child["last_ts"] > parent["last_ts"]:
+        parent["last_ts"] = child["last_ts"]
+    if child["start_ts"] and (parent["start_ts"] is None or child["start_ts"] < parent["start_ts"]):
+        parent["start_ts"] = child["start_ts"]
+    return _recompute_totals(parent)
 
 def _parse_jsonl(path, proj_slug, since):
     session_id = path.stem
@@ -486,25 +544,8 @@ def restrict_sessions(sessions, since):
         kept = {k: b for k, b in s["day_models"].items() if k[0] >= cutoff}
         if not kept:
             continue
-        total, days, models = new_bucket(), defaultdict(new_bucket), defaultdict(new_bucket)
-        for (day, model), b in kept.items():
-            bucket_merge(total, b)
-            bucket_merge(days[day], b)
-            bucket_merge(models[model], b)
-        r = dict(s)
-        r.update({
-            "day_models": kept, "days": dict(days), "models": dict(models),
-            "messages": total["messages"],
-            "input_tokens": total["input"], "output_tokens": total["output"],
-            "cache_creation_tokens": total["cache_create"],
-            "cache_creation_1h_tokens": total["cache_create_1h"],
-            "cache_read_tokens": total["cache_read"],
-            "cost": total["cost"], "uncached_cost": total["uncached_cost"],
-            "unpriced_tokens": total["unpriced"],
-            "unpriced_models": sorted(m for m, b in models.items() if b["unpriced"]),
-            "turns": [t for t in s["turns"] if t[0] >= since.timestamp()],
-        })
-        out.append(r)
+        r = dict(s, day_models=kept, turns=[t for t in s["turns"] if t[0] >= since.timestamp()])
+        out.append(_recompute_totals(r))
     return out
 
 # ── Display helpers ───────────────────────────────────────────────────────────
@@ -527,6 +568,9 @@ def fmt_cost(d, unpriced=False, width=COST_W):
     mark = UNPRICED_MARK if unpriced else ""
     pad = " " * max(0, width - len(text) - len(mark))
     return pad + c(color, text) + (c(RED, mark) if mark else "")
+
+def display_project(s):
+    return ("↳ " + s["project"]) if s.get("parent_id") else s["project"]
 
 def session_cost(s, width=COST_W):
     return fmt_cost(s["cost"], s.get("unpriced_tokens", 0), width)
@@ -578,7 +622,7 @@ def model_badge(m, width=None):
 
 def _render_top_run(s, show_tasks):
     day = s["last_ts"].strftime("%m-%d")
-    proj = c(WHITE, s["project"][:24].ljust(25))
+    proj = c(WHITE, display_project(s)[:24].ljust(25))
     if show_tasks:
         detail = display_task(s) or ""
     else:
@@ -662,7 +706,7 @@ def render(sessions, args):
             b = display_branch(s)
             branch = f" [{b}]" if b else ""
             age = fmt_age(s["mtime"])
-            proj_str = c(WHITE, s["project"][:35].ljust(36))
+            proj_str = c(WHITE, display_project(s)[:35].ljust(36))
             branch_str = c(GRAY, branch[:20].ljust(21))
             rate = burn_rate([s], now)
             rate_str = c(ORANGE if rate >= 20 else GRAY, f"${rate:,.2f}/h".rjust(10))
@@ -770,9 +814,12 @@ def render(sessions, args):
             day = s["last_ts"].strftime("%m-%d")
             b = display_branch(s)
             branch = f"[{b}]" if b else ""
-            print(f"  {c(GRAY, day)}  {c(WHITE, s['project'][:28].ljust(29))}"
+            turns = f"{s['messages']}t"
+            if s.get("subagents"):
+                turns += f" +{s['subagents']}ag"
+            print(f"  {c(GRAY, day)}  {c(WHITE, display_project(s)[:28].ljust(29))}"
                   f"  {c(GRAY, branch[:20].ljust(21))}"
-                  f"  {session_cost(s)}  {c(GRAY, str(s['messages']) + ' turns')}"
+                  f"  {session_cost(s)}  {c(GRAY, turns.ljust(10))}"
                   f"  {model_badge(s['model'])}")
 
     # ── Footer ────────────────────────────────────────────────────────────────
@@ -839,6 +886,9 @@ def session_out(s, show_tasks):
         "uncached_cost": round(s["uncached_cost"], 6),
         "unpriced_tokens": s["unpriced_tokens"],
         "unpriced_models": s["unpriced_models"],
+        "subagents": s.get("subagents", 0),
+        "subagent_cost": round(s.get("subagent_cost", 0.0), 6),
+        "parent_id": s.get("parent_id"),
         "models": {m: _bucket_out(b) for m, b in sorted(s["models"].items())},
     }
     if show_tasks:
@@ -907,6 +957,8 @@ def main():
     ap.add_argument("--since",    type=str, default=None, metavar="YYYY-MM-DD",
                     help="Only sessions active on/after this UTC date (overrides the 30-day window)")
     ap.add_argument("--json",     action="store_true",   help="Print a JSON report instead of the dashboard")
+    ap.add_argument("--split-subagents", action="store_true",
+                    help="List subagent transcripts as their own rows instead of rolling them into the parent session")
     ap.add_argument("--tasks",    action="store_true",
                     help="Show each session's first prompt in TOP RUNS (off by default: it is private text)")
     ap.add_argument("--redact",   action="store_true",
@@ -945,7 +997,10 @@ def main():
     session_cache = {} if args.watch else None
 
     def load_and_render():
-        sessions = restrict_sessions(parse_sessions(projects_dir, since=since, cache=session_cache), since)
+        sessions = restrict_sessions(
+            parse_sessions(projects_dir, since=since, cache=session_cache,
+                           split_subagents=args.split_subagents),
+            since)
         if args.project:
             sessions = [s for s in sessions if args.project.lower() in s["project"].lower()]
         if args.json:
