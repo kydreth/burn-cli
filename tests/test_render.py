@@ -3,12 +3,25 @@ import contextlib
 import io
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tests.helpers import assistant_lines, load_module, touch, user_line, write_jsonl
 
 cb = load_module()
+
+# Midday UTC, so "earlier today" (3 h ago) and "last hour" never straddle midnight.
+NOW = datetime(2026, 1, 10, 12, 0, tzinfo=timezone.utc)
+_clock = mock.patch.object(cb, "_now", lambda: NOW)
+
+
+def setUpModule():
+    _clock.start()
+
+
+def tearDownModule():
+    _clock.stop()
 
 USAGE = {"input_tokens": 100, "output_tokens": 50,
          "cache_creation_input_tokens": 1000, "cache_read_input_tokens": 2000}
@@ -41,7 +54,7 @@ def default_args(**over):
 
 class RenderStreams(unittest.TestCase):
     def test_dashboard_goes_to_stdout_only(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             root = make_projects(tmp, now)
             sessions = cb.parse_sessions(root)
@@ -56,7 +69,7 @@ class RenderStreams(unittest.TestCase):
         self.assertEqual(len(sessions), 3)
 
     def test_no_color_output_has_no_escape_codes(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             root = make_projects(tmp, now)
             sessions = cb.parse_sessions(root)
@@ -68,7 +81,7 @@ class RenderStreams(unittest.TestCase):
 
 class ModelTable(unittest.TestCase):
     def test_models_section_lists_models_and_unpriced_row(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         cb._warned_models.clear()
         with tempfile.TemporaryDirectory() as tmp:
             root = make_projects(tmp, now)
@@ -87,7 +100,7 @@ class ModelTable(unittest.TestCase):
         self.assertRegex(text, r"unpriced\s+1\s+3K\s+—\s+claude-unknown-9")
 
     def test_models_in_window_respects_days(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             sessions = cb.parse_sessions(make_projects(tmp, now))
         week = cb.models_in_window(sessions, now, 7)
@@ -98,7 +111,7 @@ class ModelTable(unittest.TestCase):
 
 class BurnRateAndBudget(unittest.TestCase):
     def test_burn_rate_counts_only_last_hour(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             sessions = cb.parse_sessions(make_projects(tmp, now))
         active = [s for s in sessions if s["id"] == "active"]
@@ -113,7 +126,7 @@ class BurnRateAndBudget(unittest.TestCase):
         self.assertAlmostEqual(cb.projected_end_of_day(5.0, 0.0, now), 5.0)
 
     def test_budget_exit_code_and_message(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             sessions = cb.parse_sessions(make_projects(tmp, now))
         today = now.strftime("%Y-%m-%d")
@@ -132,7 +145,7 @@ class BurnRateAndBudget(unittest.TestCase):
 class JsonReport(unittest.TestCase):
     def test_json_is_the_only_stdout_and_sums_agree(self):
         import json as _json
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             sessions = cb.parse_sessions(make_projects(tmp, now))
             out, err = io.StringIO(), io.StringIO()
@@ -153,7 +166,7 @@ class JsonReport(unittest.TestCase):
 
     def test_json_budget_exit_and_tasks_redacted(self):
         import json as _json
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             sessions = cb.parse_sessions(make_projects(tmp, now))
             out = io.StringIO()
@@ -170,7 +183,7 @@ class JsonReport(unittest.TestCase):
         self.assertTrue(all(s["branch"].startswith("#") for s in report["sessions"]))
 
     def test_restrict_sessions_drops_turns_before_since(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         old = now - timedelta(days=10)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -188,7 +201,7 @@ class JsonReport(unittest.TestCase):
         self.assertEqual(cb.restrict_sessions([s], now + timedelta(days=1)), [])
 
     def test_since_filters_old_sessions(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             root = make_projects(tmp, now)
             all_sessions = cb.parse_sessions(root)
@@ -210,7 +223,7 @@ class CacheEfficiency(unittest.TestCase):
 
     def test_cache_section_and_json(self):
         import json as _json
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             sessions = cb.parse_sessions(make_projects(tmp, now))
             out = io.StringIO()
@@ -233,7 +246,7 @@ class CacheEfficiency(unittest.TestCase):
 
 class PromptPrivacy(unittest.TestCase):
     def render(self, **over):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             root = make_projects(tmp, now)
             sessions = cb.parse_sessions(root)

@@ -3,11 +3,10 @@ import io
 import json
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
 
 from tests.helpers import load_module
-from tests.test_render import default_args, make_projects
+from tests.test_render import NOW, default_args, make_projects, setUpModule, tearDownModule  # noqa: F401
 
 cb = load_module()
 
@@ -56,7 +55,7 @@ class TaskIdFromBranch(unittest.TestCase):
 
 class ByTaskSection(unittest.TestCase):
     def test_section_and_json(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             sessions = cb.parse_sessions(make_projects(tmp, now))
             out = io.StringIO()
@@ -81,7 +80,7 @@ class ByTaskSection(unittest.TestCase):
         self.assertEqual(active["task_id"], "x-1")
 
     def test_redact_hashes_task_ids(self):
-        now = datetime.now(tz=timezone.utc)
+        now = NOW
         with tempfile.TemporaryDirectory() as tmp:
             sessions = cb.parse_sessions(make_projects(tmp, now))
         cb.REDACT = True

@@ -26,6 +26,11 @@ _ZERO_COST_MODELS = {"<synthetic>"}
 # Per-turn (timestamp, cost) pairs are kept this far back for burn-rate maths.
 RECENT_TURNS_SECONDS = 25 * 3600
 
+
+def _now():
+    """Current UTC time. The one clock read in the tool, so tests can pin it."""
+    return datetime.now(tz=timezone.utc)
+
 def _load_pricing():
     if not _PRICING_FILE.exists():
         print(
@@ -408,7 +413,7 @@ def _parse_jsonl(path, proj_slug, since):
     total = new_bucket()
     day_models = defaultdict(new_bucket)  # ("YYYY-MM-DD", model) -> bucket, per turn
     turns = []                        # (epoch, cost) for recent turns, for burn rate
-    turns_cutoff = time.time() - RECENT_TURNS_SECONDS
+    turns_cutoff = _now().timestamp() - RECENT_TURNS_SECONDS
     unpriced_models = set()
     start_ts = last_ts = None
     sidechain = False
@@ -613,7 +618,7 @@ def fmt_tokens(n):
     return str(n)
 
 def fmt_age(dt):
-    now = datetime.now(tz=timezone.utc)
+    now = _now()
     delta = now - dt
     s = int(delta.total_seconds())
     if s < 60:
@@ -777,7 +782,7 @@ def render_model_table(by_model):
 
 # ── Render functions ──────────────────────────────────────────────────────────
 def render(sessions, args):
-    now = datetime.now(tz=timezone.utc)
+    now = _now()
     today_str = now.strftime("%Y-%m-%d")
     ten_min_ago = now - timedelta(minutes=10)
     seven_days_ago = now - timedelta(days=7)
@@ -1016,7 +1021,7 @@ def session_out(s, show_tasks):
 
 def build_report(sessions, args, now=None, since=None):
     """Machine-readable equivalent of the dashboard (per session, project, day, model)."""
-    now = now or datetime.now(tz=timezone.utc)
+    now = now or _now()
     today_str = now.strftime("%Y-%m-%d")
 
     by_proj, by_day, by_model = defaultdict(new_bucket), defaultdict(new_bucket), defaultdict(new_bucket)
@@ -1111,7 +1116,7 @@ def main():
     elif args.all_time:
         since = None
     else:
-        since = datetime.now(tz=timezone.utc) - timedelta(days=max(args.days, 30))
+        since = _now() - timedelta(days=max(args.days, 30))
 
     if args.json and args.watch:
         ap.error("--json cannot be combined with --watch")
